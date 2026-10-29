@@ -151,10 +151,10 @@ def main():
     lines += [
         "",
         f"Partial sharing finishes the crowd {results[False] / results[True]:.1f}x faster. "
-        f"Without it the seed alone uploads {args.crowd} x {args.crowd_size_mb} MB; the lower bound is "
-        f"{args.crowd * args.crowd_size_mb / limit_mb:.0f} s. With it, every downloader also uploads; "
-        f"the seed must still send each piece at least once, so the lower bound is "
-        f"{args.crowd_size_mb / limit_mb:.0f} s.",
+        f"Without it a downloader uploads only once it has the whole file; if the seed alone served "
+        f"everyone it would take {args.crowd * args.crowd_size_mb / limit_mb:.0f} s. With it, every "
+        f"downloader uploads from its first piece on; the seed must still send each piece at least "
+        f"once, so the lower bound is {args.crowd_size_mb / limit_mb:.0f} s.",
         "",
     ]
 

@@ -231,19 +231,19 @@ A tracker's console also takes `disconnect` and `reconnect`, which cut and resto
 
 | Seeders | Time | Throughput | Speed-up |
 |---:|---:|---:|---:|
-| 1 | 8.20 s | 2.0 MB/s | 1.0x |
-| 2 | 4.20 s | 3.8 MB/s | 2.0x |
-| 4 | 2.20 s | 7.3 MB/s | 3.7x |
-| 8 | 1.25 s | 12.8 MB/s | 6.6x |
+| 1 | 8.29 s | 1.9 MB/s | 1.0x |
+| 2 | 4.30 s | 3.7 MB/s | 1.9x |
+| 4 | 2.32 s | 6.9 MB/s | 3.6x |
+| 8 | 1.29 s | 12.4 MB/s | 6.4x |
 
 **Flash crowd**: 8 clients start downloading an 8 MB file at the same moment, and only one peer has it.
 
-| Partial sharing | Time until all 8 finish |
-|---|---:|
-| off (seed only after finishing) | 32.1 s |
-| on | 12.0 s (2.7x faster) |
+| Partial sharing | Time until all 8 finish | Before one-at-a-time uploads |
+|---|---:|---:|
+| off (seed only after finishing) | 14.9 s | 32.1 s |
+| on | 6.9 s | 12.0 s |
 
-Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the floor, and the result sits exactly on it. With partial sharing, the downloaders upload to each other while they download.
+With partial sharing, the downloaders upload to each other while they download; the floor is 4 s, the time for the seed to send every piece once. Sending one piece at a time is what brought the crowd from 12.0 s to 6.9 s: before, the seed spread its uplink over all 16 requests in flight, so no piece arrived until about 4 s in and the downloaders had nothing to share until then. It also helps without partial sharing (32.1 s to 14.9 s), because downloaders now finish one after another and start seeding instead of all finishing together at the end. Seeder scaling costs 1-5% for it (8.20 s to 8.29 s with one seeder): a seeder now waits a round trip between pieces instead of overlapping two.
 
 ---
 
@@ -253,4 +253,5 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 * **Conflicts during a split are settled by Lamport order, not by the clock on the wall.** If both sides change the same item while cut off, the change with the higher stamp wins, which need not be the later one in real time. Tombstones are never cleaned up.
 * **Nothing is encrypted in transit.** Passwords travel from client to tracker in plain text (there is no TLS); only what the trackers store and sync is hashed.
 * **A share key can't be revoked.** Someone who leaves a group keeps the keys of files they already fetched metadata for.
-* **Each piece request opens a new TCP connection**, and there is no choking or tit-for-tat incentive as in BitTorrent.
+* **Each piece request opens a new TCP connection.** On loopback the handshake is negligible next to a 250 ms piece transfer (measured), but on a real network a persistent connection per peer would save a round trip per piece.
+* **No incentive to upload.** Peers serve whoever asks first; BitTorrent instead favours peers that upload back (tit-for-tat).
