@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <csignal>
+#include <algorithm>
 
 using namespace std;
 
@@ -488,8 +489,14 @@ void Tracker::list_files(int sock, const vector<string>& args) {
     send_response(sock, response);
 }
 
+// A share key is 128 random bits as lowercase hex.
+static bool is_share_key(const string& s) {
+    return s.size() == 32 && all_of(s.begin(), s.end(), [](char c) { return isdigit(c) || (c >= 'a' && c <= 'f'); });
+}
+
+// upload_file <group_id> <file_name> <size> <file_sha1> <share_key> <piece_sha1>...
 void Tracker::upload_file(int sock, const vector<string>& args) {
-    if (args.size() < 5) {
+    if (args.size() < 6) {
         send_response(sock, "error :  Invalid upload command format.");
         return;
     }
@@ -526,14 +533,19 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
     new_file.filename = filename;
     new_file.file_size = stoll(args[3]);
     new_file.file_hash = args[4];
+    new_file.share_key = args[5];
+    if (!is_share_key(new_file.share_key)) {
+        send_response(sock, "error :  Malformed share key.");
+        return;
+    }
     long long expected_pieces = (new_file.file_size + PIECE_SIZE - 1) / PIECE_SIZE;
-    if (new_file.file_size < 0 || (long long)args.size() - 5 != expected_pieces) {
+    if (new_file.file_size < 0 || (long long)args.size() - 6 != expected_pieces) {
         send_response(sock, "error :  Piece hash count does not match the file size.");
         return;
     }
-    
-    for (size_t i = 5; i < args.size(); ++i) {
-        new_file.piece_hashes[i-5] = args[i];
+
+    for (size_t i = 6; i < args.size(); ++i) {
+        new_file.piece_hashes[i-6] = args[i];
     }
 
     new_file.seeders.insert(client_addr);
@@ -597,7 +609,8 @@ void Tracker::download_file(int sock, const vector<string>& args) {
     log_msg(hashes_log);
 
     stringstream response;
-    response << "success " << file.file_size << " " << file.file_hash;
+    // Only members get this far, so only members learn the share key.
+    response << "success " << file.file_size << " " << file.file_hash << " " << file.share_key;
     for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
         response << " " << file.piece_hashes.at(i);
     }
@@ -772,7 +785,8 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
             snapshot.push_back(make_message({"synced_JOIN_GROUP", group_id, pending}));
         }
         for (const auto& [filename, file] : group.files) {
-            vector<string> msg = {"synced_UPLOAD", group_id, filename, to_string(file.file_size), file.file_hash};
+            vector<string> msg = {"synced_UPLOAD", group_id, filename, to_string(file.file_size), file.file_hash,
+                                  file.share_key};
             for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
                 msg.push_back(file.piece_hashes.at(i));
             }
@@ -846,7 +860,7 @@ void Tracker::process_sync_command(const vector<string>& args) {
     static const map<string, size_t> min_args = {
         {"synced_CREATE_USER", 3}, {"synced_LOGIN", 3}, {"synced_LOGOUT", 3},
         {"synced_CREATE_GROUP", 3}, {"synced_JOIN_GROUP", 3}, {"synced_LEAVE_GROUP", 3},
-        {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 6}, {"synced_STOP_SHARE", 4},
+        {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 7}, {"synced_STOP_SHARE", 4},
         {"synced_ADD_SEEDER", 4}, {"synced_SNAPSHOT_END", 2},
     };
     auto rule = min_args.find(command);
@@ -901,7 +915,8 @@ void Tracker::apply_sync_command(const vector<string>& args) {
         file.filename = filename;
         file.file_size = stoll(args[3]);
         file.file_hash = args[4];
-        for(size_t i = 5; i < args.size() - 1; ++i) file.piece_hashes[i-5] = args[i];
+        file.share_key = args[5];
+        for(size_t i = 6; i < args.size() - 1; ++i) file.piece_hashes[i-6] = args[i];
         if (args.back() != "-") file.seeders.insert(args.back());
     } else if (command == "synced_STOP_SHARE") {
         lock_guard<mutex> lock(groups_mutex);

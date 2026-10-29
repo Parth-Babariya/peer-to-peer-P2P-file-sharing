@@ -14,6 +14,9 @@ struct FileInfo {
     string filename;
     long long file_size;
     string file_hash;
+    // Random secret the uploader picked. Peers serve pieces only to whoever
+    // presents it, and the tracker hands it out only to group members.
+    string share_key;
     map<int, string> piece_hashes;
     set<string> seeders; // client_ip:port
 };

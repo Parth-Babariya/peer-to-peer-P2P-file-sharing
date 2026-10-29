@@ -181,6 +181,17 @@ def frame(args, payload):
     return data if args.wire == "raw" else struct.pack("!I", len(data)) + data
 
 
+def ask(args, sock, line, binary=False):
+    """Sends one message on a raw socket and returns the reply."""
+    sock.sendall(frame(args, line))
+    if args.wire == "raw":
+        reply = sock.recv(65536)
+    else:
+        (n,) = struct.unpack("!I", sock.recv(4, socket.MSG_WAITALL))
+        reply = sock.recv(n, socket.MSG_WAITALL) if n else b""
+    return reply if binary else reply.decode(errors="replace")
+
+
 def rst_close(sock):
     """Close with an immediate RST so the other side's next send() hits a dead socket."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
@@ -399,6 +410,34 @@ def test_seeder_survives_malformed_request(cl):
     a.cmd("list_groups", OK + " g")
 
 
+def test_seeder_requires_the_share_key(cl):
+    # Knowing a seeder's address and a file name is not enough: pieces go only to
+    # peers with the file's share key, which the tracker gives only to members.
+    a = cl.client("a", "a", group="g")
+    data = write_random(cl.path("f.bin"), PIECE + 10, 15)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+
+    def from_seeder(line, binary=False):
+        with socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5) as s:
+            return ask(cl.args, s, line, binary)
+
+    for line in ["have f.bin", "get_piece f.bin 0", f"have f.bin {'0' * 32}", f"get_piece f.bin {'0' * 32} 0"]:
+        assert from_seeder(line) == "", f"seeder answered {line!r} without the key"
+
+    with socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5) as t:
+        ask(cl.args, t, "create_user outsider pw")
+        ask(cl.args, t, "login outsider pw 5000")
+        reply = ask(cl.args, t, "download_file g f.bin")
+        assert reply.startswith("error"), f"a non-member got the file's metadata: {reply!r}"
+        ask(cl.args, t, "join_group g")
+        a.cmd("accept_request g outsider")
+        reply = ask(cl.args, t, "download_file g f.bin").split(" ")
+    assert reply[0] == "success", reply
+    key = reply[3]
+    assert from_seeder(f"have f.bin {key}") == "11"
+    assert from_seeder(f"get_piece f.bin {key} 1", binary=True) == data[PIECE:]
+
+
 def test_tracker_survives_garbage(cl):
     for blob in [b"\xff\xff\xff\xff", b"\x00\x00\x00\x05abc", b"login", b"\x00" * 64]:
         s = socket.create_connection(("127.0.0.1", cl.ports[0]))
@@ -414,21 +453,16 @@ def test_tracker_rejects_malformed_upload(cl):
     # Talk to the tracker directly, as a buggy or hostile client could.
     s = socket.create_connection(("127.0.0.1", cl.ports[0]))
     s.settimeout(5)
-
-    def ask(line):
-        s.sendall(frame(cl.args, line))
-        if cl.args.wire == "raw":
-            return s.recv(65536).decode(errors="replace")
-        (n,) = struct.unpack("!I", s.recv(4, socket.MSG_WAITALL))
-        return s.recv(n, socket.MSG_WAITALL).decode(errors="replace")
-
-    ask("create_user z pw")
-    ask("login z pw 5000")
-    ask("create_group q")
-    reply = ask("upload_file q f.bin notanumber deadbeef")
+    ask(cl.args, s, "create_user z pw")
+    ask(cl.args, s, "login z pw 5000")
+    ask(cl.args, s, "create_group q")
+    key = "0" * 32
+    reply = ask(cl.args, s, f"upload_file q f.bin notanumber deadbeef {key} h")
     assert reply.startswith("error"), f"unexpected reply {reply!r}"
-    reply = ask("upload_file q f.bin 2000000 deadbeef onlyonehash")
+    reply = ask(cl.args, s, f"upload_file q f.bin 2000000 deadbeef {key} onlyonehash")
     assert reply.startswith("error"), f"accepted 1 piece hash for a 4-piece file: {reply!r}"
+    reply = ask(cl.args, s, "upload_file q f.bin 10 deadbeef guessable h")
+    assert reply.startswith("error"), f"accepted a malformed share key: {reply!r}"
     s.close()
     time.sleep(0.3)
     assert cl.t1.alive(), "tracker 1 died on a malformed upload"

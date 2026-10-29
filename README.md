@@ -22,6 +22,7 @@ This implementation is designed with the constraint of using only **standard sys
 
 * **Trackers** keep the metadata: users, sessions, groups, join requests, and for every shared file its size, SHA1 hashes and the list of peers seeding it. They never see file contents, and they store each password only as a salted PBKDF2-SHA256 hash, which is also all that is synced. Every change one tracker makes is forwarded to the other, so either can serve any client. Tracker 1 keeps redialling tracker 2 every second; each time they connect, both send their entire state, then stream later changes. A tracker that restarts empty therefore catches up as soon as the link is back.
 * **Clients** split a file into **512 KB pieces** and hash each one. Uploading registers the hashes with the tracker; the file itself stays on the uploader's disk. Every client runs a small seeder server that hands out pieces of the files it shares.
+* **Access control:** the uploader picks a random 128-bit share key for each file. The tracker hands it out only with the file's metadata, which only group members can get, and a seeder serves `have` and `get_piece` only to peers that present it. Knowing a seeder's address and a file name is not enough to download the file.
 * **Downloading** asks the tracker for the piece hashes and the seeders, then asks each seeder which pieces it has (`have`, one character per piece). Eight worker threads fetch pieces in parallel, at most two from any one seeder.
   * **Rarest first:** each worker takes the missing piece held by the fewest seeders, with random tie-breaks so that simultaneous downloaders want different pieces.
   * **Verification:** each piece's SHA1 is checked before it is written, and the whole file's SHA1 at the end.
@@ -32,7 +33,7 @@ This implementation is designed with the constraint of using only **standard sys
 
 ### Wire protocol
 
-Every message on every connection (client-tracker, tracker-tracker, peer-peer) is a **4-byte big-endian length followed by that many bytes**. TCP is a byte stream, so without this two messages sent back to back can arrive as one and a long one can arrive in pieces. The payload is a space-separated command such as `upload_file <group> <name> <size> <file_sha1> <piece_sha1>...`. Inside a field, `%`, spaces and control characters are percent-encoded (`my%20notes.txt`), so names may contain spaces. A piece reply is the raw piece bytes (empty if the peer doesn't have it), and a `have` reply is a string such as `1101`. Messages are capped at 64 MiB.
+Every message on every connection (client-tracker, tracker-tracker, peer-peer) is a **4-byte big-endian length followed by that many bytes**. TCP is a byte stream, so without this two messages sent back to back can arrive as one and a long one can arrive in pieces. The payload is a space-separated command such as `upload_file <group> <name> <size> <file_sha1> <share_key> <piece_sha1>...`. Inside a field, `%`, spaces and control characters are percent-encoded (`my%20notes.txt`), so names may contain spaces. A piece reply is the raw piece bytes (empty if the peer doesn't have it), and a `have` reply is a string such as `1101`. Messages are capped at 64 MiB.
 
 ### Concurrency
 
@@ -247,6 +248,6 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 * **Merging after a split is a union.** If the trackers are cut off from each other while both keep running, merging on reconnect keeps everything either side has. A deletion made during the split (a logout, a user leaving a group) can come back.
 * **A restarted tracker serves clients immediately**, possibly before the other tracker's snapshot has arrived.
 * **Nothing is encrypted in transit.** Passwords travel from client to tracker in plain text (there is no TLS); only what the trackers store and sync is hashed.
-* A peer serves any piece it has to anyone who asks, without checking group membership.
+* **A share key can't be revoked.** Someone who leaves a group keeps the keys of files they already fetched metadata for.
 * **Each piece request opens a new TCP connection**, and there is no choking or tit-for-tat incentive as in BitTorrent.
 * A command retried after failover may already have been applied by the tracker that died (for example, `create_group` then reports that the group exists).

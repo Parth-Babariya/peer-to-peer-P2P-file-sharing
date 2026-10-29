@@ -21,6 +21,11 @@ struct DownloadState {
     map<int, string> piece_hashes;
 };
 
+struct SharedFile {
+    string path;
+    string key; // share key from the tracker; peers must present it
+};
+
 class Client {
 public:
     // upload_limit_kbps: cap on bytes served to peers (0 = no cap), to emulate a home uplink.
@@ -67,7 +72,7 @@ private:
     map<string, DownloadState> ongoing_downloads; // filename -> state
     mutex downloads_mutex;
 
-    map<string, string> shared_files; // filename -> local_path
+    map<string, SharedFile> shared_files; // filename -> where it is, and its key
     mutex shared_files_mutex;
 
     bool partial_sharing;
