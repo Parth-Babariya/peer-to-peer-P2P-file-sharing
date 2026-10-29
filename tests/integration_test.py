@@ -102,6 +102,19 @@ class Cluster:
         self.t2 = self._spawn("tracker2", [args.tracker, "trackers.txt", "2"])
         self.t1.wait_for("Connected to other tracker", timeout=10)
 
+    def restart_tracker(self, n):
+        """Kill tracker n (1 or 2) and start a fresh, empty one in its place."""
+        old = self.t1 if n == 1 else self.t2
+        old.kill()
+        new = self._spawn(f"tracker{n}", [self.args.tracker, "trackers.txt", str(n)])
+        if n == 1:
+            self.t1 = new
+        else:
+            self.t2 = new
+        # Logged once the other tracker's whole snapshot has been applied.
+        new.wait_for("Caught up with other tracker", timeout=10)
+        return new
+
     def path(self, name):
         return os.path.join(self.dir, name)
 
@@ -337,6 +350,36 @@ def test_uploads_during_synced_logouts(cl):
         up.cmd(f"upload_file g {cl.path('f.bin')}")
     up.cmd("list_files g", OK + " f.bin", timeout=5)
     assert cl.t2.alive()
+
+
+def restarted_tracker_catches_up(cl, n):
+    survivor = cl.t2 if n == 1 else cl.t1
+    a = cl.client("a", "a", group="g")
+    b = cl.client("b", "b")
+    data = write_random(cl.path("f.bin"), 3 * PIECE + 7, 11)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    (cl.t1 if n == 1 else cl.t2).kill()
+    # Changes made while tracker n is down exist only on the survivor.
+    c = cl.client("c", "c", info="trackers.txt" if n == 2 else "trackers_rev.txt")
+    join(a, c, "g")
+    c.cmd("create_group made_while_down")
+    cl.restart_tracker(n)
+    # Now lose the survivor: tracker n alone must know everything.
+    survivor.kill()
+    b.cmd("list_groups", OK + r" .*made_while_down")  # b fails over and logs back in
+    c.cmd("list_files g", OK + " f.bin")
+    c.cmd(f"download_file g f.bin {cl.path('c.bin')}", r"Starting download")
+    c.wait_for(r"Download completed", timeout=20)
+    with open(cl.path("c.bin"), "rb") as f:
+        assert f.read() == data
+
+
+def test_restarted_tracker1_catches_up(cl):
+    restarted_tracker_catches_up(cl, 1)
+
+
+def test_restarted_tracker2_catches_up(cl):
+    restarted_tracker_catches_up(cl, 2)
 
 
 def test_failover_keeps_session(cl):

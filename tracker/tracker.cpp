@@ -83,8 +83,9 @@ void Tracker::start() {
     thread client_thread(&Tracker::listen_for_clients, this);
     thread tracker_thread(&Tracker::listen_for_tracker, this);
     
+    // Tracker 1 dials and tracker 2 listens, both for as long as they run, so the
+    // pair reconnects whichever one restarts.
     if (tracker_id == 1) {
-        this_thread::sleep_for(chrono::seconds(2));
         thread connect_thread(&Tracker::connect_to_other_tracker, this);
         connect_thread.detach();
     }
@@ -667,11 +668,11 @@ void Tracker::listen_for_tracker() {
     int listener_socket = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(listener_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    sockaddr_in sync_addr;
+
+    sockaddr_in sync_addr{};
     sync_addr.sin_family = AF_INET;
     sync_addr.sin_addr.s_addr = INADDR_ANY;
-    sync_addr.sin_port = htons(port + 100); 
+    sync_addr.sin_port = htons(port + 100);
 
     if (bind(listener_socket, (struct sockaddr*)&sync_addr, sizeof(sync_addr)) < 0) {
         log_msg("sync bind failed on port " + to_string(port+100));
@@ -679,42 +680,109 @@ void Tracker::listen_for_tracker() {
         return;
     }
     listen(listener_socket, 1);
-    
+
     log_msg("Listening for other tracker on port " + to_string(port + 100));
 
-    int sync_sock = accept(listener_socket, nullptr, nullptr);
-    close(listener_socket);
-
-    if (sync_sock > 0) {
+    while (true) {
+        int sync_sock = accept(listener_socket, nullptr, nullptr);
+        if (sync_sock < 0) continue;
         log_msg("Other tracker connected for synchronization.");
-        {
-            lock_guard<mutex> lock(other_tracker_socket_mutex);
-            other_tracker_socket = sync_sock;
-        }
-        handle_sync_connection(sync_sock);
+        run_sync_session(sync_sock);
     }
 }
 
-
 void Tracker::connect_to_other_tracker() {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(other_tracker_port + 100);
-    server_addr.sin_addr.s_addr = inet_addr(other_tracker_addr.c_str());
+    bool reported = false;
+    while (true) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(other_tracker_port + 100);
+        server_addr.sin_addr.s_addr = inet_addr(other_tracker_addr.c_str());
 
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        log_msg("Could not connect to other tracker. Will operate in standalone mode.");
-        close(sock);
-        return;
+        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            close(sock);
+            if (!reported) {
+                log_msg("Other tracker unreachable. Running standalone and retrying every second.");
+                reported = true;
+            }
+            this_thread::sleep_for(chrono::seconds(1));
+            continue;
+        }
+
+        log_msg("Connected to other tracker.");
+        reported = false;
+        run_sync_session(sock);
     }
-    
-    log_msg("Connected to other tracker.");
-    {
-        lock_guard<mutex> lock(other_tracker_socket_mutex);
-        other_tracker_socket = sock;
+}
+
+// One sync connection, from connect to disconnect. Both sides send their whole
+// state first, then every later change, so a tracker that restarted empty
+// catches up. Returns when the connection is lost.
+void Tracker::run_sync_session(int sync_socket) {
+    // Start reading before sending our snapshot: if both snapshots are larger than
+    // the socket buffers and neither side reads, both sends would block forever.
+    thread reader(&Tracker::handle_sync_connection, this, sync_socket);
+    send_snapshot_and_attach(sync_socket);
+    reader.join();
+}
+
+// Sends the full state as ordinary sync messages, then makes this socket the
+// target of live sync messages. The snapshot is taken with every state lock held,
+// and other_tracker_socket_mutex is taken before they are released, so each change
+// is either already in the snapshot or sent after it, never lost in between.
+// Applying the same message twice is harmless.
+void Tracker::send_snapshot_and_attach(int sync_socket) {
+    vector<string> snapshot;
+    unique_lock<mutex> users_lock(users_mutex);
+    unique_lock<mutex> session_lock(logged_in_users_mutex);
+    unique_lock<mutex> socket_lock(socket_to_user_mutex);
+    unique_lock<mutex> groups_lock(groups_mutex);
+
+    for (const auto& [user_id, password] : users) {
+        snapshot.push_back("synced_CREATE_USER " + user_id + " " + password);
     }
-    handle_sync_connection(sock);
+    for (const auto& [user_id, addr] : logged_in_users) {
+        snapshot.push_back("synced_LOGIN " + user_id + " " + addr);
+    }
+    for (const auto& [group_id, group] : groups) {
+        snapshot.push_back("synced_CREATE_GROUP " + group_id + " " + group.owner_id);
+        for (const auto& member : group.members) {
+            snapshot.push_back("synced_ACCEPT_REQUEST " + group_id + " " + member);
+        }
+        for (const auto& pending : group.pending_requests) {
+            snapshot.push_back("synced_JOIN_GROUP " + group_id + " " + pending);
+        }
+        for (const auto& [filename, file] : group.files) {
+            stringstream msg;
+            msg << "synced_UPLOAD " << group_id << " " << filename << " " << file.file_size << " " << file.file_hash;
+            for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
+                msg << " " << file.piece_hashes.at(i);
+            }
+            msg << " " << (file.seeders.empty() ? "-" : *file.seeders.begin());
+            snapshot.push_back(msg.str());
+            for (const auto& seeder : file.seeders) {
+                snapshot.push_back("synced_ADD_SEEDER " + group_id + " " + filename + " " + seeder);
+            }
+        }
+    }
+
+    lock_guard<mutex> lock(other_tracker_socket_mutex);
+    groups_lock.unlock();
+    socket_lock.unlock();
+    session_lock.unlock();
+    users_lock.unlock();
+
+    // The end marker lets the other side know (and log) when it has caught up.
+    snapshot.push_back("synced_SNAPSHOT_END " + to_string(snapshot.size()));
+    for (const auto& msg : snapshot) {
+        if (!send_msg(sync_socket, msg)) {
+            shutdown(sync_socket, SHUT_RDWR); // the reader thread notices and closes it
+            return;
+        }
+    }
+    log_msg("Sent state snapshot (" + to_string(snapshot.size() - 1) + " messages) to other tracker.");
+    other_tracker_socket = sync_socket;
 }
 
 void Tracker::handle_sync_connection(int sync_socket) {
@@ -727,10 +795,12 @@ void Tracker::handle_sync_connection(int sync_socket) {
     {
         lock_guard<mutex> lock(other_tracker_socket_mutex);
         if (other_tracker_socket == sync_socket) {
-            close(other_tracker_socket);
             other_tracker_socket = -1;
         }
     }
+    // Only this thread closes the socket, so its fd number can't be reused by
+    // another connection while a read on it is still in progress.
+    close(sync_socket);
 }
 
 void Tracker::send_sync_message(const string& message) {
@@ -738,7 +808,7 @@ void Tracker::send_sync_message(const string& message) {
     if (other_tracker_socket != -1) {
         if (!send_msg(other_tracker_socket, message)) {
             log_msg("Failed to send sync message. Other tracker may be down.");
-            close(other_tracker_socket);
+            shutdown(other_tracker_socket, SHUT_RDWR); // the reader thread closes it
             other_tracker_socket = -1;
         } else {
             log_msg("Sent sync message: " + message);
@@ -755,7 +825,7 @@ void Tracker::process_sync_command(const vector<string>& args) {
         {"synced_CREATE_USER", 3}, {"synced_LOGIN", 3}, {"synced_LOGOUT", 3},
         {"synced_CREATE_GROUP", 3}, {"synced_JOIN_GROUP", 3}, {"synced_LEAVE_GROUP", 3},
         {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 6}, {"synced_STOP_SHARE", 4},
-        {"synced_ADD_SEEDER", 4},
+        {"synced_ADD_SEEDER", 4}, {"synced_SNAPSHOT_END", 2},
     };
     auto rule = min_args.find(command);
     if (rule == min_args.end() || args.size() < rule->second) {
@@ -785,7 +855,10 @@ void Tracker::apply_sync_command(const vector<string>& args) {
         for(auto& g_pair : groups) for(auto& f_pair : g_pair.second.files) f_pair.second.seeders.erase(args[2]);
     } else if (command == "synced_CREATE_GROUP") {
         lock_guard<mutex> lock(groups_mutex);
-        Group g; g.group_id = args[1]; g.owner_id = args[2]; g.members.insert(args[2]); groups[args[1]] = g;
+        // Create only if absent: a snapshot must not wipe members or files we already have.
+        if (!groups.count(args[1])) {
+            Group g; g.group_id = args[1]; g.owner_id = args[2]; g.members.insert(args[2]); groups[args[1]] = g;
+        }
     } else if (command == "synced_JOIN_GROUP") {
         lock_guard<mutex> lock(groups_mutex);
         if(groups.count(args[1])) groups.at(args[1]).pending_requests.insert(args[2]);
@@ -807,7 +880,7 @@ void Tracker::apply_sync_command(const vector<string>& args) {
         file.file_size = stoll(args[3]);
         file.file_hash = args[4];
         for(size_t i = 5; i < args.size() - 1; ++i) file.piece_hashes[i-5] = args[i];
-        file.seeders.insert(args.back());
+        if (args.back() != "-") file.seeders.insert(args.back());
     } else if (command == "synced_STOP_SHARE") {
         lock_guard<mutex> lock(groups_mutex);
         if(groups.count(args[1]) && groups.at(args[1]).files.count(args[2])) {
@@ -818,6 +891,8 @@ void Tracker::apply_sync_command(const vector<string>& args) {
         if(groups.count(args[1]) && groups.at(args[1]).files.count(args[2])) {
             groups.at(args[1]).files.at(args[2]).seeders.insert(args[3]);
         }
+    } else if (command == "synced_SNAPSHOT_END") {
+        log_msg("Caught up with other tracker's state (" + args[1] + " messages).");
     }
 }
 
