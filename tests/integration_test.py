@@ -330,6 +330,21 @@ def test_cannot_log_out_someone_else(cl):
     b.wait_for(r"Download completed", timeout=20)
 
 
+def test_passwords_are_not_stored(cl):
+    # The trackers keep only a salted hash, and only the hash crosses the sync
+    # link; the password itself must not show up anywhere in their output.
+    a = cl.client("a")
+    a.cmd("create_user alice s3cret-Passw0rd")
+    a.cmd("login alice s3cret-Passw0rd")
+    b = cl.client("b", info="trackers_rev.txt")  # tracker 2 knows alice only from sync
+    b.cmd("login alice wrong-password", ERR)
+    b.cmd("login nobody s3cret-Passw0rd", ERR)
+    b.cmd("login alice s3cret-Passw0rd")
+    for tracker in (cl.t1, cl.t2):
+        leaked = [l for l in tracker.lines if "s3cret" in l]
+        assert not leaked, f"{tracker.name} printed the password: {leaked[0]!r}"
+
+
 def test_list_files_needs_membership(cl):
     a = cl.client("a", "a", group="g")
     write_random(cl.path("secret.bin"), 100, 10)

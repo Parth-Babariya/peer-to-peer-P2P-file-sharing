@@ -47,6 +47,16 @@ bool decode_fields(const string& msg, vector<string>& fields);
 // inside one word. False on an unmatched quote or an empty quoted word.
 bool split_words(const string& line, vector<string>& words);
 
+// `bytes` random bytes from OpenSSL's CSPRNG, as hex.
+string random_hex(size_t bytes);
+
+// Compares two secrets in time that doesn't depend on where they first differ.
+bool same_secret(const string& a, const string& b);
+
+// What the tracker stores instead of a password: a salted, deliberately slow
+// PBKDF2-SHA256 hash, "pbkdf2_sha256$<iterations>$<salt>$<hash>".
+string hash_password(const string& password);
+bool check_password(const string& password, const string& stored);
 
 // Log message to console with a prefix (safe to call from several threads)
 void log_msg(const string& msg);

@@ -186,16 +186,18 @@ void Tracker::create_user(int sock, const vector<string>& args) {
         return;
     }
     const string& user_id = args[1];
-    const string& password = args[2];
+    // Only a salted hash is kept, and only it is synced. Hashing is slow on
+    // purpose, so it happens before taking the lock.
+    string record = hash_password(args[2]);
 
     lock_guard<mutex> lock(users_mutex);
     if (users.count(user_id)) {
         send_response(sock, "error : User already exists");
     } else {
-        users[user_id] = password;
+        users[user_id] = record;
         send_response(sock, "success User created");
         log_msg("User " + user_id + " created.");
-        send_sync_message(make_message({"synced_CREATE_USER", user_id, password}));
+        send_sync_message(make_message({"synced_CREATE_USER", user_id, record}));
     }
 }
 
@@ -208,14 +210,23 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
     const string& password = args[2];
     const string& client_port = args[3];
 
-    lock_guard<mutex> user_lock(users_mutex);
-    lock_guard<mutex> session_lock(logged_in_users_mutex);
-    lock_guard<mutex> socket_lock(socket_to_user_mutex);
-
-    if (users.find(user_id) == users.end() || users.at(user_id) != password) {
+    string record;
+    {
+        lock_guard<mutex> lock(users_mutex);
+        auto it = users.find(user_id);
+        if (it != users.end()) record = it->second;
+    }
+    // Slow on purpose, so no lock is held. An unknown user is checked against a
+    // dummy record, so the reply time doesn't reveal which user ids exist.
+    static const string dummy_record = hash_password("");
+    bool valid = check_password(password, record.empty() ? dummy_record : record) && !record.empty();
+    if (!valid) {
         send_response(sock, "error :  Invalid credentials");
         return;
     }
+
+    lock_guard<mutex> session_lock(logged_in_users_mutex);
+    lock_guard<mutex> socket_lock(socket_to_user_mutex);
 
     if (logged_in_users.count(user_id)) {
         log_msg("User " + user_id + " is re-establishing session from a new connection.");
@@ -746,8 +757,8 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
     unique_lock<mutex> socket_lock(socket_to_user_mutex);
     unique_lock<mutex> groups_lock(groups_mutex);
 
-    for (const auto& [user_id, password] : users) {
-        snapshot.push_back(make_message({"synced_CREATE_USER", user_id, password}));
+    for (const auto& [user_id, record] : users) {
+        snapshot.push_back(make_message({"synced_CREATE_USER", user_id, record}));
     }
     for (const auto& [user_id, addr] : logged_in_users) {
         snapshot.push_back(make_message({"synced_LOGIN", user_id, addr}));
@@ -821,7 +832,8 @@ void Tracker::send_sync_message(const string& message) {
             shutdown(other_tracker_socket, SHUT_RDWR); // the reader thread closes it
             other_tracker_socket = -1;
         } else {
-            log_msg("Sent sync message: " + message);
+            // Only the type: a user record holds a password hash.
+            log_msg("Sent sync message: " + message.substr(0, message.find(' ')));
         }
     }
 }

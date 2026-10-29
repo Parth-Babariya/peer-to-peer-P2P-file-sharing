@@ -20,7 +20,7 @@ This implementation is designed with the constraint of using only **standard sys
                                          the pieces it has to B)
 ```
 
-* **Trackers** keep the metadata: users, sessions, groups, join requests, and for every shared file its size, SHA1 hashes and the list of peers seeding it. They never see file contents. Every change one tracker makes is forwarded to the other, so either can serve any client. Tracker 1 keeps redialling tracker 2 every second; each time they connect, both send their entire state, then stream later changes. A tracker that restarts empty therefore catches up as soon as the link is back.
+* **Trackers** keep the metadata: users, sessions, groups, join requests, and for every shared file its size, SHA1 hashes and the list of peers seeding it. They never see file contents, and they store each password only as a salted PBKDF2-SHA256 hash, which is also all that is synced. Every change one tracker makes is forwarded to the other, so either can serve any client. Tracker 1 keeps redialling tracker 2 every second; each time they connect, both send their entire state, then stream later changes. A tracker that restarts empty therefore catches up as soon as the link is back.
 * **Clients** split a file into **512 KB pieces** and hash each one. Uploading registers the hashes with the tracker; the file itself stays on the uploader's disk. Every client runs a small seeder server that hands out pieces of the files it shares.
 * **Downloading** asks the tracker for the piece hashes and the seeders, then asks each seeder which pieces it has (`have`, one character per piece). Eight worker threads fetch pieces in parallel, at most two from any one seeder.
   * **Rarest first:** each worker takes the missing piece held by the fewest seeders, with random tie-breaks so that simultaneous downloaders want different pieces.
@@ -246,6 +246,7 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 * **Tracker state lives in memory.** A restarted tracker gets everything back from the other one, but if both go down together, the state is lost.
 * **Merging after a split is a union.** If the trackers are cut off from each other while both keep running, merging on reconnect keeps everything either side has. A deletion made during the split (a logout, a user leaving a group) can come back.
 * **A restarted tracker serves clients immediately**, possibly before the other tracker's snapshot has arrived.
-* **Passwords are stored and sent in plain text**, and a peer serves any piece it has to anyone who asks, without checking group membership.
+* **Nothing is encrypted in transit.** Passwords travel from client to tracker in plain text (there is no TLS); only what the trackers store and sync is hashed.
+* A peer serves any piece it has to anyone who asks, without checking group membership.
 * **Each piece request opens a new TCP connection**, and there is no choking or tit-for-tat incentive as in BitTorrent.
 * A command retried after failover may already have been applied by the tracker that died (for example, `create_group` then reports that the group exists).

@@ -75,7 +75,7 @@ private:
     int server_socket;
 
     // Synchronized data
-    map<string, string> users; // user_id -> password
+    map<string, string> users; // user_id -> hash_password() record, never the password
     map<string, string> logged_in_users; // user_id -> client_ip:port
     map<int, string> socket_to_user; // client_socket -> user_id
     map<string, Group> groups;

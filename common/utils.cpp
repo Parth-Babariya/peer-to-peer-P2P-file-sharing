@@ -9,7 +9,10 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
 #include <cctype>
+#include <cstdlib>
 
 using namespace std;
 
@@ -153,6 +156,50 @@ bool split_words(const string& line, vector<string>& words) {
         }
         words.push_back(word);
     }
+}
+
+string random_hex(size_t bytes) {
+    vector<unsigned char> buf(bytes);
+    if (RAND_bytes(buf.data(), bytes) != 1) {
+        log_msg("FATAL: no randomness available.");
+        abort();
+    }
+    return to_hex(buf.data(), bytes);
+}
+
+bool same_secret(const string& a, const string& b) {
+    return a.size() == b.size() && CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
+// OWASP suggests 600,000 for PBKDF2-SHA256; this is lower to keep logins (and
+// the tests) quick. Each record stores its own count, so it can be raised later.
+static const int PASSWORD_HASH_ITERATIONS = 100000;
+
+static string pbkdf2(const string& password, const string& salt, int iterations) {
+    unsigned char out[32];
+    PKCS5_PBKDF2_HMAC(password.data(), password.size(),
+                      reinterpret_cast<const unsigned char*>(salt.data()), salt.size(),
+                      iterations, EVP_sha256(), sizeof(out), out);
+    return to_hex(out, sizeof(out));
+}
+
+string hash_password(const string& password) {
+    string salt = random_hex(16);
+    return "pbkdf2_sha256$" + to_string(PASSWORD_HASH_ITERATIONS) + "$" + salt + "$" +
+           pbkdf2(password, salt, PASSWORD_HASH_ITERATIONS);
+}
+
+bool check_password(const string& password, const string& stored) {
+    auto parts = parse(stored, "$");
+    if (parts.size() != 4 || parts[0] != "pbkdf2_sha256") return false;
+    int iterations;
+    try {
+        iterations = stoi(parts[1]);
+    } catch (const exception&) {
+        return false;
+    }
+    if (iterations <= 0) return false;
+    return same_secret(pbkdf2(password, parts[2], iterations), parts[3]);
 }
 
 void log_msg(const string& msg) {
