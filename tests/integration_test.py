@@ -84,13 +84,29 @@ class Proc:
         self.p.wait()
 
 
+def free_tracker_ports():
+    """A base port where base, base+1 and their sync ports (+100) are all free.
+
+    Stays below Linux's ephemeral range (32768+), where outgoing connections
+    would otherwise grab ports at random."""
+    while True:
+        base = random.randint(20000, 32000)
+        try:
+            for port in [base, base + 1, base + 100, base + 101]:
+                with socket.socket() as s:
+                    s.bind(("127.0.0.1", port))
+            return base
+        except OSError:
+            continue
+
+
 class Cluster:
     """Two trackers plus any number of clients, all in a scratch directory."""
 
     def __init__(self, args):
         self.args = args
         self.dir = tempfile.mkdtemp(prefix="p2p-test-")
-        base = random.randint(20000, 40000)
+        base = free_tracker_ports()
         self.ports = [base, base + 1]
         self.procs = []
         with open(self.path("trackers.txt"), "w") as f:
