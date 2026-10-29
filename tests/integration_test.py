@@ -315,6 +315,21 @@ def test_tracker_rejects_malformed_upload(cl):
     assert cl.t1.alive(), "tracker 1 died on a malformed upload"
 
 
+def test_uploads_during_synced_logouts(cl):
+    # Tracker 2 handles uploads itself (groups lock, then sessions lock) while
+    # applying logouts synced from tracker 1 (sessions, then groups). Opposite
+    # lock orders can deadlock; run under ThreadSanitizer this shows up as a
+    # lock-order inversion even when the timing doesn't hit.
+    up = cl.client("up", "up", info="trackers_rev.txt", group="g")
+    write_random(cl.path("f.bin"), 1000, 9)
+    for i in range(10):
+        churn = cl.client(f"churn{i}", f"churn{i}")
+        churn.cmd("logout")
+        up.cmd(f"upload_file g {cl.path('f.bin')}")
+    up.cmd("list_files g", OK + " f.bin", timeout=5)
+    assert cl.t2.alive()
+
+
 def test_failover_keeps_session(cl):
     a = cl.client("a", "a", group="g")
     cl.t1.kill()

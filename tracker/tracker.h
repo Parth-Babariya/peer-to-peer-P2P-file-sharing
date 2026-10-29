@@ -77,7 +77,9 @@ private:
     map<int, string> socket_to_user; // client_socket -> user_id
     map<string, Group> groups;
 
-    // Mutexes
+    // Mutexes. When holding more than one, always take them in this order:
+    //   users -> logged_in_users -> socket_to_user -> groups -> other_tracker_socket
+    // Taking them in different orders on two threads can deadlock.
     mutex users_mutex;
     mutex logged_in_users_mutex;
     mutex groups_mutex;

@@ -473,7 +473,14 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
 
     const string& group_id = args[1];
     const string& filename = args[2];
-    
+
+    // Look this up before taking groups_mutex: see the lock order in tracker.h.
+    string client_addr = get_address_from_user_id(user_id);
+    if(client_addr.empty()) {
+        send_response(sock, "error :  Could not find your address info.");
+        return;
+    }
+
     lock_guard<mutex> lock(groups_mutex);
     if (groups.find(group_id) == groups.end()) {
         send_response(sock, "error :  Group does not exist.");
@@ -500,11 +507,6 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
         new_file.piece_hashes[i-5] = args[i];
     }
 
-    string client_addr = get_address_from_user_id(user_id);
-    if(client_addr.empty()) {
-        send_response(sock, "error :  Could not find your address info.");
-        return;
-    }
     new_file.seeders.insert(client_addr);
 
     group.files[filename] = new_file;
