@@ -64,8 +64,9 @@ void Client::run()
     }
 
     process_user_input();
-    
-    if (tracker_socket != -1) 
+
+    lock_guard<mutex> lock(tracker_mutex);
+    if (tracker_socket != -1)
     {
         close(tracker_socket);
     }
@@ -539,5 +540,8 @@ int main(int argc, char* argv[]) {
     Client client(tracker_info_file);
     client.run();
 
-    return 0;
+    // Download and seeder threads are detached and still use `client`; returning
+    // would destroy it under them. End the process without running destructors.
+    cout.flush();
+    _exit(0);
 }

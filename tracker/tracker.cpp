@@ -93,7 +93,9 @@ void Tracker::start() {
     cout << "Tracker console running. Type 'quit' to shut down." << endl;
     while (cin >> command) {
         if (command == "quit") {
-            exit(0);
+            // Skip static destructors: client and sync threads are still running.
+            cout.flush();
+            _exit(0);
         }
     }
     // stdin closed (e.g. running in the background): keep serving.
