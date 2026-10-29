@@ -53,13 +53,13 @@ class Proc:
 
     def wait_for(self, pattern, since=0, timeout=10.0):
         rx = re.compile(pattern)
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         with self.cv:
             while True:
                 for line in self.lines[since:]:
                     if rx.search(line):
                         return line
-                left = deadline - time.time()
+                left = deadline - time.monotonic()
                 if left <= 0:
                     tail = "\n    ".join(self.lines[-8:])
                     raise AssertionError(f"{self.name}: no line matching {pattern!r} within "
@@ -242,9 +242,9 @@ def test_sync_burst(cl):
     m = a.mark()
     for i in range(30):
         a.send(f"create_group burst{i:02d}")
-    deadline = time.time() + 10
+    deadline = time.monotonic() + 10
     while sum("Group created" in l for l in a.lines[m:]) < 30:
-        assert time.time() < deadline, "not every create_group was answered"
+        assert time.monotonic() < deadline, "not every create_group was answered"
         time.sleep(0.1)
     c = cl.client("c", "c", info="trackers_rev.txt")
     line = c.cmd("list_groups")
@@ -466,14 +466,14 @@ def main():
     tests = [t for t in TESTS if args.k in t.__name__]
     for test in tests:
         cl = Cluster(args)
-        start = time.time()
+        start = time.monotonic()
         try:
             test(cl)
-            print(f"PASS  {test.__name__}  ({time.time() - start:.1f}s)", flush=True)
+            print(f"PASS  {test.__name__}  ({time.monotonic() - start:.1f}s)", flush=True)
         except Exception as e:
             failed += 1
             msg = str(e) if isinstance(e, AssertionError) else traceback.format_exc()
-            print(f"FAIL  {test.__name__}  ({time.time() - start:.1f}s)\n  {msg}", flush=True)
+            print(f"FAIL  {test.__name__}  ({time.monotonic() - start:.1f}s)\n  {msg}", flush=True)
         finally:
             cl.close()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
