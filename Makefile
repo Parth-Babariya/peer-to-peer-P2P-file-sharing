@@ -1,5 +1,6 @@
-# Builds both programs. `make test` runs the end-to-end tests;
-# `make tsan` runs them again with ThreadSanitizer builds.
+# Builds both programs. `make test` runs the end-to-end tests,
+# `make tsan` runs them again with ThreadSanitizer builds, and
+# `make bench` runs the download benchmarks.
 
 TSAN_CXXFLAGS = -std=c++17 -I../common -pthread -g -O1 -fsanitize=thread
 TSAN_LDFLAGS = -lssl -lcrypto -fsanitize=thread
@@ -10,6 +11,9 @@ all:
 
 test: all
 	python3 tests/integration_test.py
+
+bench: all
+	python3 tests/benchmark.py
 
 # setarch -R turns off address randomisation, which recent kernels set too high for TSan.
 # Run `make clean` afterwards to go back to normal builds.
@@ -24,4 +28,4 @@ clean:
 	$(MAKE) -C tracker clean
 	$(MAKE) -C client clean
 
-.PHONY: all test tsan clean
+.PHONY: all test bench tsan clean
