@@ -136,8 +136,7 @@ void Tracker::handle_client(int client_socket, const string& client_addr) {
 
     string user_id = get_user_id_from_socket(client_socket);
     if (!user_id.empty()) {
-        vector<string> logout_args = {"logout", user_id};
-        logout(client_socket, logout_args);
+        end_session(client_socket, user_id);
     }
     log_msg("Client " + client_addr + " disconnected.");
     close(client_socket);
@@ -236,18 +235,22 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
 }
 
 void Tracker::logout(int sock, const vector<string>& args) {
-    string user_id;
-    if (args.size() > 1) { 
-        user_id = args[1];
-    } else {
-        user_id = get_user_id_from_socket(sock);
+    if (args.size() != 1) {
+        send_response(sock, "error :  Usage: logout");
+        return;
     }
-
+    // Only ever the session on this connection: a user id from the client is not trusted.
+    string user_id = get_user_id_from_socket(sock);
     if (user_id.empty()) {
         send_response(sock, "error :  Not logged in");
         return;
     }
-    
+    end_session(sock, user_id);
+    send_response(sock, "success Logout successful");
+}
+
+// Logs the user out and stops advertising them as a seeder, here and on the other tracker.
+void Tracker::end_session(int sock, const string& user_id) {
     string user_addr = get_address_from_user_id(user_id);
 
     {
@@ -266,7 +269,6 @@ void Tracker::logout(int sock, const vector<string>& args) {
         }
     }
 
-    send_response(sock, "success Logout successful");
     log_msg("User " + user_id + " logged out.");
     send_sync_message("synced_LOGOUT " + user_id + " " + user_addr);
 }
@@ -442,11 +444,20 @@ void Tracker::list_files(int sock, const vector<string>& args) {
         send_response(sock, "error :  Usage: list_files <group_id>");
         return;
     }
+    string user_id = get_user_id_from_socket(sock);
+    if (user_id.empty()) {
+        send_response(sock, "error :  Not logged in.");
+        return;
+    }
     const string& group_id = args[1];
-    
+
     lock_guard<mutex> lock(groups_mutex);
     if (!groups.count(group_id)) {
         send_response(sock, "error :  Group does not exist.");
+        return;
+    }
+    if (!groups.at(group_id).members.count(user_id)) {
+        send_response(sock, "error :  Not a member of this group.");
         return;
     }
     const auto& files = groups.at(group_id).files;

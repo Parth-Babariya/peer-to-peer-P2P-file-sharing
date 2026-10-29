@@ -235,6 +235,15 @@ def test_cannot_log_out_someone_else(cl):
     b.wait_for(r"Download completed", timeout=20)
 
 
+def test_list_files_needs_membership(cl):
+    a = cl.client("a", "a", group="g")
+    write_random(cl.path("secret.bin"), 100, 10)
+    a.cmd(f"upload_file g {cl.path('secret.bin')}")
+    outsider = cl.client("outsider", "outsider")
+    outsider.cmd("list_files g", ERR)
+    a.cmd("list_files g", OK + " secret.bin")
+
+
 def test_bad_seeder_fails_instead_of_looping(cl):
     a = cl.client("a", "a", group="g")
     b = cl.client("b", "b")

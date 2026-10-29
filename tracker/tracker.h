@@ -47,6 +47,7 @@ private:
     void create_user(int sock, const vector<string>& args);
     void login(int sock, const string& client_addr, const vector<string>& args);
     void logout(int sock, const vector<string>& args);
+    void end_session(int sock, const string& user_id);
     void create_group(int sock, const vector<string>& args);
     void join_group(int sock, const vector<string>& args);
     void leave_group(int sock, const vector<string>& args);
