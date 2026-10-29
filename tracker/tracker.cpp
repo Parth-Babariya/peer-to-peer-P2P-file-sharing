@@ -583,20 +583,33 @@ void Tracker::stop_share(int sock, const vector<string>& args) {
 }
 
 void Tracker::i_am_seeder(int sock, const vector<string>& args) {
-    if (args.size() != 3) return; // i_am_seeder <group_id> <filename>
+    // Every command gets exactly one reply; the client waits for it.
+    if (args.size() != 3) {
+        send_response(sock, "error :  Usage: i_am_seeder <group_id> <file_name>");
+        return;
+    }
     string user_id = get_user_id_from_socket(sock);
-    if (user_id.empty()) return;
+    if (user_id.empty()) {
+        send_response(sock, "error :  Not logged in.");
+        return;
+    }
 
     const string& group_id = args[1];
     const string& filename = args[2];
     string seeder_addr = get_address_from_user_id(user_id);
-    if (seeder_addr.empty()) return;
+    if (seeder_addr.empty()) {
+        send_response(sock, "error :  Could not find your address info.");
+        return;
+    }
 
     lock_guard<mutex> lock(groups_mutex);
     if(groups.count(group_id) && groups.at(group_id).files.count(filename)) {
         groups.at(group_id).files.at(filename).seeders.insert(seeder_addr);
         log_msg("User " + user_id + " is now a seeder for " + filename);
+        send_response(sock, "success Now seeding " + filename);
         send_sync_message("synced_ADD_SEEDER " + group_id + " " + filename + " " + seeder_addr);
+    } else {
+        send_response(sock, "error File or group not found.");
     }
 }
 

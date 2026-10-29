@@ -33,7 +33,8 @@ private:
     // connection failover management
     bool connect_to_available_tracker();
     bool try_connect_to(const string& addr);
-    string send_to_tracker(const string& command, bool is_retry = false);
+    string send_to_tracker(const string& command);
+    bool request_reply(const string& command, string& response);
 
     // command handlers
     void handle_upload(const vector<string>& args);
@@ -47,7 +48,10 @@ private:
     vector<string> tracker_addresses;
     int current_tracker_idx = 0;
     int tracker_socket = -1;
-    
+    // The prompt and every download thread share one tracker connection; each
+    // request and its reply happen under this lock so replies can't be swapped.
+    mutex tracker_mutex;
+
     int seeder_port;
 
     bool is_logged_in = false;

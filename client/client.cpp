@@ -114,46 +114,44 @@ bool Client::connect_to_available_tracker() {
     return false;
 }
 
-string Client::send_to_tracker(const string& command, bool is_retry) {
-    if (tracker_socket < 0) {
-        return "ERROR: Not connected to any tracker.";
+bool Client::request_reply(const string& command, string& response) {
+    return tracker_socket >= 0 && send_msg(tracker_socket, command) && recv_msg(tracker_socket, response);
+}
+
+// Sends one command and returns the tracker's reply. If the connection is broken,
+// fails over to the other tracker, logs back in, and retries the command once.
+string Client::send_to_tracker(const string& command) {
+    lock_guard<mutex> lock(tracker_mutex);
+    string response;
+    if (request_reply(command, response)) {
+        return response;
     }
 
-    auto attempt_failover_and_retry = [&]() -> string {
-        if (is_retry) {
-            return "ERROR: Failed to send command to the secondary tracker.";
-        }
-
-        log_msg("Connection lost. Attempting to reconnect and retry...");
+    log_msg("Connection lost. Attempting to reconnect and retry...");
+    if (tracker_socket >= 0) {
         close(tracker_socket);
         tracker_socket = -1;
-
-        if (!connect_to_available_tracker()) {
-            return "ERROR: All trackers are down.";
-        }
-
-        if (is_logged_in) {
-            log_msg("Re-authenticating session with new tracker...");
-            string login_cmd = "login " + user_id + " " + password + " " + to_string(seeder_port);
-            
-            string login_response;
-            if (!send_msg(tracker_socket, login_cmd) || !recv_msg(tracker_socket, login_response) ||
-                login_response.find("success") == string::npos) {
-                log_msg("Warning: Re-login failed. You may need to login manually.");
-                is_logged_in = false;
-            } else {
-                 log_msg("Re-authentication successful.");
-            }
-        }
-        
-        return send_to_tracker(command, true);
-    };
-
-    string response;
-    if (!send_msg(tracker_socket, command) || !recv_msg(tracker_socket, response)) {
-        return attempt_failover_and_retry();
     }
-    return response;
+    if (!connect_to_available_tracker()) {
+        return "ERROR: All trackers are down.";
+    }
+
+    if (is_logged_in) {
+        log_msg("Re-authenticating session with new tracker...");
+        string login_cmd = "login " + user_id + " " + password + " " + to_string(seeder_port);
+        string login_response;
+        if (!request_reply(login_cmd, login_response) || login_response.find("success") == string::npos) {
+            log_msg("Warning: Re-login failed. You may need to login manually.");
+            is_logged_in = false;
+        } else {
+            log_msg("Re-authentication successful.");
+        }
+    }
+
+    if (request_reply(command, response)) {
+        return response;
+    }
+    return "ERROR: Failed to send command to the secondary tracker.";
 }
 
 
@@ -178,6 +176,7 @@ void Client::process_user_input() {
             string response = send_to_tracker(line);
             cout << response << endl;
             if (command == "logout" && response.find("success") != string::npos) {
+                lock_guard<mutex> lock(tracker_mutex);
                 is_logged_in = false;
                 user_id = "";
                 password = "";
@@ -196,6 +195,7 @@ void Client::handle_login(const vector<string>& args) {
     cout << response << endl;
 
     if (response.find("success") != string::npos) {
+        lock_guard<mutex> lock(tracker_mutex);
         is_logged_in = true;
         user_id = args[1];
         password = args[2];
@@ -448,14 +448,16 @@ void Client::download_manager(const string& group_id, const string& filename, co
 
     if (pieces_to_get == 0) {
         log_msg("Download completed for " + filename);
-        lock_guard<mutex> lock(downloads_mutex);
-        ongoing_downloads[filename].status = "Completed";
-        
+        {
+            lock_guard<mutex> lock(downloads_mutex);
+            ongoing_downloads[filename].status = "Completed";
+        }
         {
             lock_guard<mutex> share_lock(shared_files_mutex);
             shared_files[filename] = dest_path;
         }
 
+        // Never hold downloads_mutex here: this waits on the network.
         string command = "i_am_seeder " + group_id + " " + filename;
         send_to_tracker(command);
     }
