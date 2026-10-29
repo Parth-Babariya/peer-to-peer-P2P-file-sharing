@@ -427,7 +427,8 @@ void Client::handle_download(const vector<string>& args) {
 static const int DOWNLOAD_WORKERS = 8;          // pieces in flight at once per download
 static const int MAX_REQUESTS_PER_SEEDER = 2;   // spreads one download over many seeders
 static const int MAX_FRUITLESS_REFRESHES = 3;   // give up when this many refreshes find nothing
-static const chrono::milliseconds REFRESH_INTERVAL(300);
+static const chrono::milliseconds REFRESH_INTERVAL(300);   // when out of work, ask again this often
+static const chrono::milliseconds PERIODIC_REFRESH(1000);  // and at least this often regardless
 
 // Connects to a peer's "ip:port"; returns the socket, or -1.
 static int connect_to_peer(const string& addr) {
@@ -639,6 +640,13 @@ void Client::download_manager(const string& group_id, const string& filename, co
     auto worker = [&]() {
         unique_lock<mutex> lk(swarm.m);
         while (swarm.remaining > 0 && !swarm.failed) {
+            // Refresh even while there is work: a full seeder always has something to
+            // offer, and without this we'd never notice that other downloaders now hold
+            // pieces too. One worker refreshes; the others keep downloading.
+            if (!swarm.refreshing && chrono::steady_clock::now() - swarm.last_refresh >= PERIODIC_REFRESH) {
+                refresh(lk);
+                continue;
+            }
             int p;
             string seeder;
             if (!pick(p, seeder)) {
