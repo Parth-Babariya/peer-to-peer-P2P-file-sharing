@@ -8,6 +8,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <random>
+#include <algorithm>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -346,34 +348,63 @@ void Client::handle_download(const vector<string>& args) {
     }
 }
 
+// Connects to a seeder's "ip:port"; returns the socket, or -1.
+static int connect_to_peer(const string& addr) {
+    size_t delim_pos = addr.find(':');
+    if (delim_pos == string::npos) return -1;
+    sockaddr_in peer_addr{};
+    peer_addr.sin_family = AF_INET;
+    try {
+        peer_addr.sin_port = htons(stoi(addr.substr(delim_pos + 1)));
+    } catch (const exception&) {
+        return -1;
+    }
+    if (inet_pton(AF_INET, addr.substr(0, delim_pos).c_str(), &peer_addr.sin_addr) != 1) return -1;
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+    // A seeder that accepts but never answers must not stall the download forever.
+    timeval timeout{10, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (connect(sock, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
 void Client::download_manager(const string& group_id, const string& filename, const string& dest_path, const vector<string>& metadata) {
+    auto set_status = [&](const string& status) {
+        lock_guard<mutex> lock(downloads_mutex);
+        ongoing_downloads[filename].status = status;
+    };
+
+    // metadata: success <file_size> <file_hash> <piece_hash>... <seeder>...
     DownloadState state;
     state.group_id = group_id;
     state.filename = filename;
     state.destination_path = dest_path;
-    state.file_size = stoll(metadata[1]);
     state.status = "Downloading";
-    state.total_pieces = (state.file_size + PIECE_SIZE - 1) / PIECE_SIZE;
-    state.pieces_downloaded.resize(state.total_pieces, false);
-    
+    try {
+        state.file_size = stoll(metadata.at(1));
+    } catch (const exception&) {
+        state.file_size = -1;
+    }
+    state.total_pieces = state.file_size < 0 ? 0 : (state.file_size + PIECE_SIZE - 1) / PIECE_SIZE;
     size_t seeder_start_index = 3 + state.total_pieces;
-    for (size_t i = 0; i < state.total_pieces; ++i) {
-        // Corrected the index to properly parse metadata
-        if ((3 + i) < metadata.size()) {
-            state.piece_hashes[i] = metadata[3 + i];
-        } else {
-             log_msg("Error: Missing piece hash metadata for piece " + to_string(i));
-             return;
-        }
+    if (state.file_size < 0 || metadata.size() < seeder_start_index) {
+        log_msg("Malformed file info from tracker. Download failed for " + filename);
+        lock_guard<mutex> lock(downloads_mutex);
+        state.status = "Failed";
+        ongoing_downloads[filename] = state;
+        return;
     }
-    
-    vector<string> seeders;
-    if (seeder_start_index < metadata.size()) {
-        for (size_t i = seeder_start_index; i < metadata.size(); ++i) {
-            seeders.push_back(metadata[i]);
-        }
+    const string& file_hash = metadata[2];
+    state.pieces_downloaded.resize(state.total_pieces, false);
+    for (int i = 0; i < state.total_pieces; ++i) {
+        state.piece_hashes[i] = metadata[3 + i];
     }
-
+    vector<string> seeders(metadata.begin() + seeder_start_index, metadata.end());
 
     {
         lock_guard<mutex> lock(downloads_mutex);
@@ -382,85 +413,82 @@ void Client::download_manager(const string& group_id, const string& filename, co
 
     int fd = open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
-        log_msg("Failed to create destination file: " + dest_path);
-        lock_guard<mutex> lock(downloads_mutex);
-        ongoing_downloads[filename].status = "Failed";
+        log_msg("Failed to create destination file: " + dest_path + ". Download failed for " + filename);
+        set_status("Failed");
         return;
     }
 
-    int pieces_to_get = state.total_pieces;
-    int seeder_idx = 0;
-    
+    // A seeder that can't be reached, hangs up, or sends a piece with the wrong
+    // hash is dropped for the rest of this download. When none are left, the
+    // download fails instead of retrying forever.
+    size_t seeder_idx = 0;
     for (int i = 0; i < state.total_pieces; ++i) {
+        long long expected_size = min<long long>(PIECE_SIZE, state.file_size - (long long)i * PIECE_SIZE);
         bool piece_ok = false;
-        while(!piece_ok) {
+        while (!piece_ok) {
             if (seeders.empty()) {
-                 log_msg("No more seeders. Download failed for " + filename);
-                 lock_guard<mutex> lock(downloads_mutex);
-                 ongoing_downloads[filename].status = "Failed";
-                 close(fd);
-                 return;
+                log_msg("No more seeders. Download failed for " + filename);
+                close(fd);
+                set_status("Failed");
+                return;
             }
-            string seeder_addr = seeders[seeder_idx % seeders.size()];
-            seeder_idx++;
-            
-            int peer_sock = socket(AF_INET, SOCK_STREAM, 0);
-            size_t delim_pos = seeder_addr.find(':');
-            string peer_ip = seeder_addr.substr(0, delim_pos);
-            int peer_port = stoi(seeder_addr.substr(delim_pos + 1));
-            
-            sockaddr_in peer_server_addr;
-            peer_server_addr.sin_family = AF_INET;
-            peer_server_addr.sin_port = htons(peer_port);
-            inet_pton(AF_INET, peer_ip.c_str(), &peer_server_addr.sin_addr);
+            seeder_idx %= seeders.size();
+            string seeder_addr = seeders[seeder_idx];
 
-            if (connect(peer_sock, (struct sockaddr*)&peer_server_addr, sizeof(peer_server_addr)) < 0) {
-                log_msg("Failed to connect to seeder " + seeder_addr);
+            int peer_sock = connect_to_peer(seeder_addr);
+            string piece;
+            string problem;
+            if (peer_sock < 0) {
+                problem = "could not connect";
+            } else {
+                log_msg("Downloading piece " + to_string(i) + " from seeder " + seeder_addr);
+                string request = "get_piece " + filename + " " + to_string(i);
+                if (!send_msg(peer_sock, request) || !recv_msg(peer_sock, piece)) {
+                    problem = "disconnected while sending piece " + to_string(i);
+                } else if ((long long)piece.size() != expected_size ||
+                           sha(piece.data(), piece.size()) != state.piece_hashes[i]) {
+                    problem = "sent a bad copy of piece " + to_string(i);
+                }
                 close(peer_sock);
+            }
+
+            if (!problem.empty()) {
+                log_msg("Seeder " + seeder_addr + " " + problem + "; dropping it.");
+                seeders.erase(seeders.begin() + seeder_idx);
                 continue;
             }
 
-            log_msg("Downloading piece " + to_string(i) + " from seeder " + seeder_addr);
-
-            string request = "get_piece " + filename + " " + to_string(i);
-            string piece;
-            if (!send_msg(peer_sock, request) || !recv_msg(peer_sock, piece)) {
-                log_msg("Seeder disconnected while reading piece " + to_string(i));
-            } else {
-                string received_hash = sha(piece.data(), piece.size());
-                if (received_hash == state.piece_hashes[i]) {
-                    pwrite(fd, piece.data(), piece.size(), (off_t)i * PIECE_SIZE);
-                    
-                    piece_ok = true;
-                    pieces_to_get--;
-
-                    lock_guard<mutex> lock(downloads_mutex);
-                    ongoing_downloads[filename].pieces_downloaded[i] = true;
-                } else {
-                    log_msg("Hash mismatch for piece " + to_string(i) + ". Retrying.");
-                }
+            if (pwrite(fd, piece.data(), piece.size(), (off_t)i * PIECE_SIZE) != (ssize_t)piece.size()) {
+                log_msg("Write to " + dest_path + " failed. Download failed for " + filename);
+                close(fd);
+                set_status("Failed");
+                return;
             }
-            close(peer_sock);
+            piece_ok = true;
+            seeder_idx++; // spread consecutive pieces across seeders
+            lock_guard<mutex> lock(downloads_mutex);
+            ongoing_downloads[filename].pieces_downloaded[i] = true;
         }
     }
-
     close(fd);
 
-    if (pieces_to_get == 0) {
-        log_msg("Download completed for " + filename);
-        {
-            lock_guard<mutex> lock(downloads_mutex);
-            ongoing_downloads[filename].status = "Completed";
-        }
-        {
-            lock_guard<mutex> share_lock(shared_files_mutex);
-            shared_files[filename] = dest_path;
-        }
-
-        // Never hold downloads_mutex here: this waits on the network.
-        string command = "i_am_seeder " + group_id + " " + filename;
-        send_to_tracker(command);
+    // Every piece matched its hash; check the whole file as well.
+    if (sha_file(dest_path) != file_hash) {
+        log_msg("Whole-file hash mismatch. Download failed for " + filename);
+        set_status("Failed");
+        return;
     }
+
+    log_msg("Download completed for " + filename);
+    set_status("Completed");
+    {
+        lock_guard<mutex> share_lock(shared_files_mutex);
+        shared_files[filename] = dest_path;
+    }
+
+    // Never hold downloads_mutex here: this waits on the network.
+    string command = "i_am_seeder " + group_id + " " + filename;
+    send_to_tracker(command);
 }
 
 void Client::show_downloads() {
@@ -473,8 +501,12 @@ void Client::show_downloads() {
         const auto& state = pair.second;
         if (state.status == "Completed") {
             cout << "[C] [" << state.group_id << "] " << state.filename << endl;
+        } else if (state.status == "Failed") {
+            cout << "[F] [" << state.group_id << "] " << state.filename << endl;
         } else {
-            cout << "[D] [" << state.group_id << "] " << state.filename << endl;
+            int done = count(state.pieces_downloaded.begin(), state.pieces_downloaded.end(), true);
+            cout << "[D] [" << state.group_id << "] " << state.filename
+                 << " (" << done << "/" << state.total_pieces << " pieces)" << endl;
         }
     }
 }
