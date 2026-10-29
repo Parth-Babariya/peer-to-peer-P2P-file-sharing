@@ -7,6 +7,7 @@
 #include <set>
 #include <mutex>
 #include <thread>
+#include <atomic>
 
 using namespace std;
 
@@ -47,6 +48,7 @@ private:
     void process_sync_command(const vector<string>& args);
     void apply_sync_command(const vector<string>& args);
     void send_sync_message(const string& message);
+    void wait_to_serve_alone();
 
     // Command handlers
     void create_user(int sock, const vector<string>& args);
@@ -92,6 +94,12 @@ private:
     mutex socket_to_user_mutex;
     mutex other_tracker_socket_mutex;
     int other_tracker_socket = -1;
+
+    // False until this tracker holds the other one's state (its snapshot has been
+    // applied), or the other one stayed unreachable for a grace period. Until then
+    // clients are turned away: an empty, restarted tracker must not answer for both.
+    atomic<bool> caught_up{false};
+    atomic<bool> sync_session_active{false};
 };
 
 #endif // TRACKER_H

@@ -90,6 +90,7 @@ void Tracker::start() {
         thread connect_thread(&Tracker::connect_to_other_tracker, this);
         connect_thread.detach();
     }
+    thread(&Tracker::wait_to_serve_alone, this).detach();
     
     string command;
     cout << "Tracker console running. Type 'quit' to shut down." << endl;
@@ -133,7 +134,9 @@ void Tracker::handle_client(int client_socket, const string& client_addr) {
     string command_str;
     while (recv_msg(client_socket, command_str)) {
         vector<string> args;
-        if (decode_fields(command_str, args)) {
+        if (!caught_up) {
+            send_response(client_socket, CATCHING_UP_REPLY);
+        } else if (decode_fields(command_str, args)) {
             process_command(client_socket, client_addr, args);
         } else {
             send_response(client_socket, "error :  Bad arguments");
@@ -751,11 +754,30 @@ void Tracker::connect_to_other_tracker() {
 // state first, then every later change, so a tracker that restarted empty
 // catches up. Returns when the connection is lost.
 void Tracker::run_sync_session(int sync_socket) {
+    sync_session_active = true;
     // Start reading before sending our snapshot: if both snapshots are larger than
     // the socket buffers and neither side reads, both sends would block forever.
     thread reader(&Tracker::handle_sync_connection, this, sync_socket);
     send_snapshot_and_attach(sync_socket);
     reader.join();
+    sync_session_active = false;
+}
+
+// How long a tracker that can't reach the other one waits before serving alone.
+static const chrono::seconds STANDALONE_GRACE(3);
+
+// Opens the doors to clients if the other tracker can't be reached at all. While
+// a sync session is open its snapshot is on the way, so keep waiting for it.
+void Tracker::wait_to_serve_alone() {
+    this_thread::sleep_for(STANDALONE_GRACE);
+    while (!caught_up) {
+        if (!sync_session_active) {
+            caught_up = true;
+            log_msg("Other tracker unreachable; serving clients from our own state.");
+            return;
+        }
+        this_thread::sleep_for(chrono::milliseconds(100));
+    }
 }
 
 // Sends the full state as ordinary sync messages, then makes this socket the
@@ -929,6 +951,7 @@ void Tracker::apply_sync_command(const vector<string>& args) {
             groups.at(args[1]).files.at(args[2]).seeders.insert(args[3]);
         }
     } else if (command == "synced_SNAPSHOT_END") {
+        caught_up = true;
         log_msg("Caught up with other tracker's state (" + args[1] + " messages).");
     }
 }

@@ -46,6 +46,7 @@ private:
     bool connect_to_available_tracker();
     bool try_connect_to(const string& addr);
     string send_to_tracker(const string& command);
+    string reconnect();
     bool request_reply(const string& command, string& response);
 
     // command handlers

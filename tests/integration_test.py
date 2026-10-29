@@ -117,6 +117,8 @@ class Cluster:
         self.t1 = self._spawn("tracker1", [args.tracker, "trackers.txt", "1"])
         self.t2 = self._spawn("tracker2", [args.tracker, "trackers.txt", "2"])
         self.t1.wait_for("Connected to other tracker", timeout=10)
+        for t in (self.t1, self.t2):
+            t.wait_for("Caught up with other tracker", timeout=10)
 
     def restart_tracker(self, n):
         """Kill tracker n (1 or 2) and start a fresh, empty one in its place."""
@@ -537,6 +539,25 @@ def test_restarted_tracker1_catches_up(cl):
 
 def test_restarted_tracker2_catches_up(cl):
     restarted_tracker_catches_up(cl, 2)
+
+
+def test_lone_restarted_tracker_waits_before_serving(cl):
+    # A restarted tracker must not answer from its empty state while the other
+    # tracker's state may be on its way. With the other one down for good, it
+    # turns clients away for a grace period, then serves alone.
+    cl.t1.kill()
+    cl.t2.kill()
+    start = time.monotonic()
+    t1 = cl._spawn("tracker1", [cl.args.tracker, "trackers.txt", "1"])
+    t1.wait_for("Tracker listening for clients")
+    with socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5) as s:
+        reply = ask(cl.args, s, "list_groups")
+    assert "catching up" in reply, f"answered before catching up: {reply!r}"
+    # A client typing meanwhile just waits, then gets served.
+    c = cl.client("c")
+    c.cmd("create_user c pw", OK, timeout=15)
+    assert time.monotonic() - start >= 2.5, "served before the grace period ended"
+    t1.wait_for("serving clients from our own state")
 
 
 def test_failover_keeps_session(cl):

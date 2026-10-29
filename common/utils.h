@@ -11,6 +11,10 @@ const int PIECE_SIZE = 512 * 1024; // 512KB
 // Largest message either side accepts; a bigger length prefix means a broken or hostile peer.
 const size_t MAX_MSG_SIZE = 64 * 1024 * 1024;
 
+// A tracker's reply while it may still be missing the other tracker's state.
+// Clients try the other tracker and come back.
+const string CATCHING_UP_REPLY = "error :  Tracker is catching up, try again shortly";
+
 // SHA1 of a buffer, as 40 hex characters
 string sha(const char* data, size_t len);
 

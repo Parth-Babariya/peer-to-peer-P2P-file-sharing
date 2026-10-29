@@ -125,16 +125,17 @@ bool Client::request_reply(const string& command, string& response) {
     return tracker_socket >= 0 && send_msg(tracker_socket, command) && recv_msg(tracker_socket, response);
 }
 
-// Sends one command and returns the tracker's reply. If the connection is broken,
-// fails over to the other tracker, logs back in, and retries the command once.
-string Client::send_to_tracker(const string& command) {
-    lock_guard<mutex> lock(tracker_mutex);
-    string response;
-    if (request_reply(command, response)) {
-        return response;
-    }
+static bool is_catching_up(const string& reply) {
+    return reply == CATCHING_UP_REPLY;
+}
 
-    log_msg("Connection lost. Attempting to reconnect and retry...");
+// How long to keep trying while trackers answer that they are catching up.
+static const chrono::seconds CATCH_UP_WAIT(10);
+
+// Connects to a tracker (the current one if it answers, else the other) and logs
+// back in if we were logged in. Returns "" on success, else the reply to show.
+// Caller holds tracker_mutex.
+string Client::reconnect() {
     if (tracker_socket >= 0) {
         close(tracker_socket);
         tracker_socket = -1;
@@ -142,23 +143,62 @@ string Client::send_to_tracker(const string& command) {
     if (!connect_to_available_tracker()) {
         return "ERROR: All trackers are down.";
     }
-
     if (is_logged_in) {
         log_msg("Re-authenticating session with new tracker...");
         string login_cmd = make_message({"login", user_id, password, to_string(seeder_port)});
         string login_response;
-        if (!request_reply(login_cmd, login_response) || login_response.find("success") == string::npos) {
+        if (!request_reply(login_cmd, login_response)) {
+            return "ERROR: Failed to send command to the secondary tracker.";
+        }
+        if (is_catching_up(login_response)) {
+            return login_response;
+        }
+        if (login_response.find("success") == string::npos) {
             log_msg("Warning: Re-login failed. You may need to login manually.");
             is_logged_in = false;
         } else {
             log_msg("Re-authentication successful.");
         }
     }
+    return "";
+}
 
-    if (request_reply(command, response)) {
-        return response;
+// Sends one command and returns the tracker's reply. If the connection is broken,
+// fails over to the other tracker, logs back in, and retries the command once.
+// A tracker that is still catching up sends us to the other one, back and forth,
+// for up to CATCH_UP_WAIT.
+string Client::send_to_tracker(const string& command) {
+    lock_guard<mutex> lock(tracker_mutex);
+    auto deadline = chrono::steady_clock::now() + CATCH_UP_WAIT;
+    bool lost_once = false;
+    while (true) {
+        string response;
+        if (request_reply(command, response)) {
+            if (!is_catching_up(response)) {
+                return response;
+            }
+        } else if (lost_once) {
+            return "ERROR: Failed to send command to the secondary tracker.";
+        } else {
+            lost_once = true;
+            log_msg("Connection lost. Attempting to reconnect and retry...");
+            response = reconnect();
+            if (response.empty()) continue;
+        }
+
+        // Catching up, here or at re-login: switch trackers and try again.
+        while (is_catching_up(response)) {
+            if (chrono::steady_clock::now() >= deadline) {
+                return response;
+            }
+            this_thread::sleep_for(chrono::milliseconds(200));
+            current_tracker_idx = (current_tracker_idx + 1) % tracker_addresses.size();
+            response = reconnect();
+        }
+        if (!response.empty()) {
+            return response;
+        }
     }
-    return "ERROR: Failed to send command to the secondary tracker.";
 }
 
 
