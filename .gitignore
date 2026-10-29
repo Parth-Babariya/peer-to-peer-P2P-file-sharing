@@ -2,3 +2,4 @@
 tracker/tracker
 client/client
 __pycache__/
+tsan-report.*

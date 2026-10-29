@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssl-dev
+      - name: Build (warnings are errors)
+        run: make CXXFLAGS="-std=c++17 -I../common -pthread -Wall -Wextra -Werror -g"
+      - name: End-to-end tests
+        run: make test
+
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssl-dev
+      - name: End-to-end tests under ThreadSanitizer
+        run: make tsan

@@ -58,7 +58,7 @@ private:
     void upload_file(int sock, const vector<string>& args);
     void download_file(int sock, const vector<string>& args);
     void stop_share(int sock, const vector<string>& args);
-    void i_am_seeder(int sock, const vector<string>& args); // New command for completed downloads
+    void i_am_seeder(int sock, const vector<string>& args); // a finished download now serves the file
 
     // Helper methods
     string get_user_id_from_socket(int sock);
