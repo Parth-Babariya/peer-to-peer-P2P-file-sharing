@@ -314,9 +314,18 @@ void Client::start_seeder_service(int seeder_socket) {
     close(seeder_socket);
 }
 
+// At most this many pieces are sent at once; further requests are told "busy"
+// and go to another peer. One piece at a time gets each piece out at full speed,
+// so its receiver can pass it on almost at once. Many at a time all crawl and
+// finish together at the end, and in a flash crowd every other peer's uplink
+// sits idle meanwhile: with 16 at once, 8 clients took 12 s; with 1, about 6.5 s.
+// (BitTorrent limits how many peers it uploads to for the same reason.)
+static const int UPLOAD_SLOTS = 1;
+
 // Serves two requests from peers, one per connection:
 //   have <group> <file> <key>          -> one char per piece, '1' if we can serve it ("" if not sharing)
-//   get_piece <group> <file> <key> <i> -> the piece's bytes ("" if we can't serve it)
+//   get_piece <group> <file> <key> <i> -> 'P' and the piece's bytes, 'N' if we can't serve
+//                                         it, or 'B' if every upload slot is taken
 // The key is the file's share key: the tracker gives it only to members of the
 // file's group, so a peer that doesn't have it gets nothing. A file still
 // downloading is served piece by piece, but only pieces already written and
@@ -366,22 +375,35 @@ void Client::handle_peer_connection(int peer_socket) {
         return;
     }
 
-    string piece;
+    string reply = "N";
     // Peers are untrusted: the index must be a plain non-negative number.
     bool valid = args.size() == 5 && args[0] == "get_piece" && !args[4].empty() && args[4].size() <= 9 &&
                  all_of(args[4].begin(), args[4].end(), ::isdigit);
-    if (valid && !file_path.empty()) {
-        long piece_index = stol(args[4]);
-        bool have_it = !partial || (piece_index < (long)held.size() && held[piece_index]);
-        int fd = have_it ? open(file_path.c_str(), O_RDONLY) : -1;
-        if (fd != -1) {
-            piece.resize(PIECE_SIZE);
-            ssize_t bytes_read = pread(fd, &piece[0], PIECE_SIZE, (off_t)piece_index * PIECE_SIZE);
-            piece.resize(bytes_read > 0 ? bytes_read : 0);
-            close(fd);
-        }
+    long piece_index = valid ? stol(args[4]) : -1;
+    bool have_it = valid && !file_path.empty() &&
+                   (!partial || (piece_index < (long)held.size() && held[piece_index]));
+    int fd = have_it ? open(file_path.c_str(), O_RDONLY) : -1;
+    if (fd == -1) {
+        send_msg(peer_socket, reply);
+        close(peer_socket);
+        return;
     }
-    send_paced(peer_socket, piece);
+
+    int slots_taken = active_uploads.load();
+    while (slots_taken < UPLOAD_SLOTS && !active_uploads.compare_exchange_weak(slots_taken, slots_taken + 1)) {
+    }
+    bool got_slot = slots_taken < UPLOAD_SLOTS;
+    if (got_slot) {
+        reply.assign(1 + PIECE_SIZE, 'P');
+        ssize_t bytes_read = pread(fd, &reply[1], PIECE_SIZE, (off_t)piece_index * PIECE_SIZE);
+        reply.resize(bytes_read > 0 ? 1 + bytes_read : 1);
+        if (bytes_read <= 0) reply = "N"; // past the end of the file
+    } else {
+        reply = "B";
+    }
+    close(fd);
+    send_paced(peer_socket, reply);
+    if (got_slot) active_uploads--;
     close(peer_socket);
 }
 
@@ -494,6 +516,7 @@ static const int MAX_REQUESTS_PER_SEEDER = 2;   // spreads one download over man
 static const int MAX_FRUITLESS_REFRESHES = 3;   // give up when this many refreshes find nothing
 static const chrono::milliseconds REFRESH_INTERVAL(300);   // when out of work, ask again this often
 static const chrono::milliseconds PERIODIC_REFRESH(1000);  // and at least this often regardless
+static const chrono::milliseconds BUSY_BACKOFF(25);       // leave a seeder alone this long after "busy"
 
 // Connects to a peer's "ip:port"; returns the socket, or -1.
 static int connect_to_peer(const string& addr) {
@@ -544,6 +567,7 @@ struct Swarm {
     map<string, string> bitfields; // live seeder -> which pieces it has ("0110...")
     map<string, int> busy;         // seeder -> requests in flight to it
     set<string> dead;              // seeders dropped for the rest of this download
+    map<string, chrono::steady_clock::time_point> backoff_until; // seeders that just said "busy"
 };
 
 void Client::download_manager(const string& group_id, const string& filename, const string& dest_path, const vector<string>& metadata) {
@@ -655,6 +679,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
     // by the fewest live seeders (ties broken randomly, so concurrent downloaders
     // spread out), from its least busy holder that has a free request slot.
     auto pick = [&](int& piece, string& seeder) {
+        auto now = chrono::steady_clock::now();
         vector<pair<int, int>> candidates; // (holders, piece)
         for (int p = 0; p < n; ++p) {
             if (swarm.done[p] || swarm.in_flight[p]) continue;
@@ -673,6 +698,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
             int best_busy = INT_MAX;
             for (const auto& [addr, bits] : swarm.bitfields) {
                 if (bits.size() != (size_t)n || bits[p] != '1') continue;
+                if (swarm.backoff_until[addr] > now) continue;
                 int b = swarm.busy[addr];
                 if (b < MAX_REQUESTS_PER_SEEDER && b < best_busy) {
                     best = addr;
@@ -688,15 +714,31 @@ void Client::download_manager(const string& group_id, const string& filename, co
         return false;
     };
 
-    enum class Fetch { Ok, NotThere, Bad };
+    // Whether a live seeder said "busy" and is still being left alone; if so,
+    // next_free is when the first of them may be asked again.
+    auto backing_off = [&](chrono::steady_clock::time_point& next_free) {
+        auto now = chrono::steady_clock::now();
+        bool any = false;
+        for (const auto& [addr, until] : swarm.backoff_until) {
+            if (until > now && swarm.bitfields.count(addr)) {
+                next_free = any ? min(next_free, until) : until;
+                any = true;
+            }
+        }
+        return any;
+    };
+
+    enum class Fetch { Ok, NotThere, Busy, Bad };
     auto fetch = [&](const string& seeder, int p, string& piece) {
         int sock = connect_to_peer(seeder);
         if (sock < 0) return Fetch::Bad;
-        log_msg("Downloading piece " + to_string(p) + " from seeder " + seeder);
         bool ok = send_msg(sock, make_message({"get_piece", group_id, filename, share_key, to_string(p)})) && recv_msg(sock, piece);
         close(sock);
-        if (!ok) return Fetch::Bad;
-        if (piece.empty()) return Fetch::NotThere; // its bitfield was out of date
+        if (!ok || piece.empty()) return Fetch::Bad;
+        if (piece == "N") return Fetch::NotThere; // its bitfield was out of date
+        if (piece == "B") return Fetch::Busy;
+        if (piece[0] != 'P') return Fetch::Bad;
+        piece.erase(0, 1);
         long long expected_size = min<long long>(PIECE_SIZE, state.file_size - (long long)p * PIECE_SIZE);
         if ((long long)piece.size() != expected_size || sha(piece.data(), piece.size()) != state.piece_hashes[p]) {
             return Fetch::Bad;
@@ -717,14 +759,23 @@ void Client::download_manager(const string& group_id, const string& filename, co
             int p;
             string seeder;
             if (!pick(p, seeder)) {
-                if (swarm.refreshing || chrono::steady_clock::now() - swarm.last_refresh < REFRESH_INTERVAL) {
+                auto now = chrono::steady_clock::now();
+                // A seeder that said "busy" may have a free slot again soon.
+                chrono::steady_clock::time_point next_free;
+                if (backing_off(next_free)) {
+                    swarm.cv.wait_until(lk, min(next_free, now + chrono::milliseconds(100)));
+                    continue;
+                }
+                if (swarm.refreshing || now - swarm.last_refresh < REFRESH_INTERVAL) {
                     swarm.cv.wait_for(lk, chrono::milliseconds(100));
                     continue;
                 }
                 refresh(lk);
-                // Nothing to fetch, nothing in flight, and asking again didn't help:
-                // after a few rounds no reachable seeder has what we still need.
-                if (!pick(p, seeder) && swarm.in_flight_count == 0 &&
+                // Nothing to fetch, nothing in flight, nobody merely busy, and asking
+                // again didn't help: after a few rounds no reachable seeder has what
+                // we still need. (While we refreshed, another worker may have been
+                // told "busy"; that is not a reason to give up.)
+                if (!pick(p, seeder) && swarm.in_flight_count == 0 && !backing_off(next_free) &&
                     ++swarm.fruitless_refreshes >= MAX_FRUITLESS_REFRESHES) {
                     swarm.failed = true;
                     swarm.cv.notify_all();
@@ -746,7 +797,12 @@ void Client::download_manager(const string& group_id, const string& filename, co
             swarm.in_flight[p] = false;
             swarm.in_flight_count--;
             swarm.busy[seeder]--;
+            if (result == Fetch::Ok) {
+                // The slot we just used is free again: the next request needn't wait.
+                swarm.backoff_until.erase(seeder);
+            }
             if (written) {
+                log_msg("Got piece " + to_string(p) + " from seeder " + seeder);
                 swarm.done[p] = true;
                 swarm.remaining--;
                 swarm.fruitless_refreshes = 0;
@@ -758,6 +814,8 @@ void Client::download_manager(const string& group_id, const string& filename, co
             } else if (result == Fetch::NotThere) {
                 auto it = swarm.bitfields.find(seeder);
                 if (it != swarm.bitfields.end()) it->second[p] = '0';
+            } else if (result == Fetch::Busy) {
+                swarm.backoff_until[seeder] = chrono::steady_clock::now() + BUSY_BACKOFF;
             } else if (!swarm.dead.count(seeder)) {
                 log_msg("Seeder " + seeder + " failed or sent a bad copy of piece " + to_string(p) + "; dropping it.");
                 swarm.dead.insert(seeder);

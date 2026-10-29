@@ -326,7 +326,7 @@ def test_sync_burst(cl):
 
 
 def seeders_used(client):
-    return set(re.findall(r"Downloading piece \d+ from seeder (\S+)", "\n".join(client.lines)))
+    return set(re.findall(r"Got piece \d+ from seeder (\S+)", "\n".join(client.lines)))
 
 
 def test_download_uses_several_seeders(cl):
@@ -367,6 +367,28 @@ def test_downloaders_share_pieces_before_finishing(cl):
     b_addr, c_addr = f"127.0.0.1:{b.seeder_port}", f"127.0.0.1:{c.seeder_port}"
     assert c_addr in seeders_used(b) or b_addr in seeders_used(c), \
         "neither downloader fetched anything from the other"
+
+
+def test_crowd_waits_out_a_busy_seed(cl):
+    # Eight downloaders and one seed, every uplink slow and sending one piece at
+    # a time, so each downloader is told "busy" for seconds on end. That means
+    # "try again soon", never "give up".
+    slow = ["--upload-limit", "2048"]
+    a = cl.client("a", "a", group="g", flags=slow)
+    data = write_random(cl.path("f.bin"), 4 * PIECE, 21)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    crowd = []
+    for i in range(8):
+        peer = cl.client(f"p{i}", f"p{i}", flags=slow + ["--no-partial-sharing"])
+        join(a, peer, "g")
+        crowd.append(peer)
+    for i, peer in enumerate(crowd):
+        peer.send(f"download_file g f.bin {cl.path(f'p{i}.bin')}")
+    for i, peer in enumerate(crowd):
+        line = peer.wait_for(r"Download (completed|failed)", timeout=30)
+        assert "completed" in line, f"p{i}: {line}"
+        with open(cl.path(f"p{i}.bin"), "rb") as f:
+            assert f.read() == data
 
 
 def test_cannot_log_out_someone_else(cl):
@@ -461,8 +483,10 @@ def test_seeder_requires_the_share_key(cl):
         with socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5) as s:
             return ask(cl.args, s, line, binary)
 
-    for line in ["have g f.bin", "get_piece g f.bin 0", f"have g f.bin {'0' * 32}", f"get_piece g f.bin {'0' * 32} 0"]:
-        assert from_seeder(line) == "", f"seeder answered {line!r} without the key"
+    for line in ["have g f.bin", f"have g f.bin {'0' * 32}"]:
+        assert from_seeder(line) in ("", "N"), f"seeder answered {line!r} without the key"
+    for line in ["get_piece g f.bin 0", f"get_piece g f.bin {'0' * 32} 0"]:
+        assert from_seeder(line) == "N", f"seeder answered {line!r} without the key"
 
     with socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5) as t:
         ask(cl.args, t, "create_user outsider pw")
@@ -475,7 +499,41 @@ def test_seeder_requires_the_share_key(cl):
     assert reply[0] == "success", reply
     key = reply[3]
     assert from_seeder(f"have g f.bin {key}") == "11"
-    assert from_seeder(f"get_piece g f.bin {key} 1", binary=True) == data[PIECE:]
+    assert from_seeder(f"get_piece g f.bin {key} 1", binary=True) == b"P" + data[PIECE:]
+
+
+def member_key(cl, owner, group, filename):
+    """Joins `group` as a new member over a raw tracker connection; returns the file's share key."""
+    with socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5) as t:
+        ask(cl.args, t, "create_user keyholder pw")
+        ask(cl.args, t, "login keyholder pw 5000")
+        ask(cl.args, t, f"join_group {group}")
+        owner.cmd(f"accept_request {group} keyholder")
+        return ask(cl.args, t, f"download_file {group} {filename}").split(" ")[3]
+
+
+def test_seeder_sends_one_piece_at_a_time(cl):
+    # While a piece is on its way to one peer, another request gets "busy" at
+    # once instead of a share of the uplink; the slot frees when the first ends.
+    a = cl.client("a", "a", group="g", flags=["--upload-limit", "64"])  # 8 s per piece
+    write_random(cl.path("f.bin"), 2 * PIECE, 20)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    key = member_key(cl, a, "g", "f.bin")
+    slow = socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5)
+    slow.sendall(frame(cl.args, f"get_piece g f.bin {key} 0"))
+    recv_exact(slow, 5)  # the transfer has started
+    with socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5) as s:
+        assert ask(cl.args, s, f"get_piece g f.bin {key} 1") == "B"
+    rst_close(slow)
+    deadline = time.monotonic() + 5
+    while True:
+        with socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5) as s:
+            s.sendall(frame(cl.args, f"get_piece g f.bin {key} 1"))
+            first = recv_exact(s, 5)[4:]
+        if first == b"P":
+            break
+        assert first == b"B" and time.monotonic() < deadline, f"the upload slot was never freed ({first!r})"
+        time.sleep(0.2)
 
 
 def test_tracker_survives_garbage(cl):

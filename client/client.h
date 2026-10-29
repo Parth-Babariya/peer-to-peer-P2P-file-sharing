@@ -8,6 +8,7 @@
 #include <thread>
 #include <chrono>
 #include <utility>
+#include <atomic>
 
 using namespace std;
 
@@ -81,7 +82,8 @@ private:
     bool partial_sharing;
     long long upload_limit_bytes; // per second, 0 = unlimited
     mutex pace_mutex;
-    chrono::steady_clock::time_point pace_next;
+    atomic<int> active_uploads{0}; // pieces being sent right now, at most UPLOAD_SLOTS
+chrono::steady_clock::time_point pace_next;
 };
 
 #endif // CLIENT_H
