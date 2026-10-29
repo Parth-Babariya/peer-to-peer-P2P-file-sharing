@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <openssl/evp.h>
+#include <cctype>
 
 using namespace std;
 
@@ -68,6 +69,90 @@ vector<string> parse(const string& str, const string& delimiter) {
     }
     tokens.push_back(str.substr(start));
     return tokens;
+}
+
+string encode_field(const string& field) {
+    static const char* digits = "0123456789ABCDEF";
+    string out;
+    for (unsigned char c : field) {
+        if (c == '%' || c == ' ' || c < 0x20 || c == 0x7f) {
+            out += '%';
+            out += digits[c >> 4];
+            out += digits[c & 15];
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+string make_message(const vector<string>& fields) {
+    string msg;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i > 0) msg += ' ';
+        msg += encode_field(fields[i]);
+    }
+    return msg;
+}
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool decode_field(const string& s, string& out) {
+    out.clear();
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '%') {
+            out += s[i];
+            continue;
+        }
+        int hi = i + 2 < s.size() ? hex_value(s[i + 1]) : -1;
+        int lo = i + 2 < s.size() ? hex_value(s[i + 2]) : -1;
+        if (hi < 0 || lo < 0) return false;
+        out += static_cast<char>(hi * 16 + lo);
+        i += 2;
+    }
+    return true;
+}
+
+bool decode_fields(const string& msg, vector<string>& fields) {
+    fields.clear();
+    for (const auto& raw : parse(msg, " ")) {
+        string field;
+        if (raw.empty() || !decode_field(raw, field)) {
+            fields.clear();
+            return false;
+        }
+        fields.push_back(field);
+    }
+    return true;
+}
+
+bool split_words(const string& line, vector<string>& words) {
+    words.clear();
+    size_t i = 0;
+    while (true) {
+        while (i < line.size() && isspace(static_cast<unsigned char>(line[i]))) i++;
+        if (i == line.size()) return true;
+        string word;
+        bool quoted = false;
+        while (i < line.size() && (quoted || !isspace(static_cast<unsigned char>(line[i])))) {
+            if (line[i] == '"') {
+                quoted = !quoted;
+            } else {
+                word += line[i];
+            }
+            i++;
+        }
+        if (quoted || word.empty()) {
+            words.clear();
+            return false;
+        }
+        words.push_back(word);
+    }
 }
 
 void log_msg(const string& msg) {

@@ -32,7 +32,7 @@ This implementation is designed with the constraint of using only **standard sys
 
 ### Wire protocol
 
-Every message on every connection (client-tracker, tracker-tracker, peer-peer) is a **4-byte big-endian length followed by that many bytes**. TCP is a byte stream, so without this two messages sent back to back can arrive as one and a long one can arrive in pieces. The payload is a space-separated command such as `upload_file <group> <name> <size> <file_sha1> <piece_sha1>...`; a piece reply is the raw piece bytes (empty if the peer doesn't have it), and a `have` reply is a string such as `1101`. Messages are capped at 64 MiB.
+Every message on every connection (client-tracker, tracker-tracker, peer-peer) is a **4-byte big-endian length followed by that many bytes**. TCP is a byte stream, so without this two messages sent back to back can arrive as one and a long one can arrive in pieces. The payload is a space-separated command such as `upload_file <group> <name> <size> <file_sha1> <piece_sha1>...`. Inside a field, `%`, spaces and control characters are percent-encoded (`my%20notes.txt`), so names may contain spaces. A piece reply is the raw piece bytes (empty if the peer doesn't have it), and a `have` reply is a string such as `1101`. Messages are capped at 64 MiB.
 
 ### Concurrency
 
@@ -198,6 +198,8 @@ Once inside the client, you can run:
   stop_share <group_id> <file_name>
   ```
 
+Names containing spaces go in double quotes, for example `download_file "my group" "holiday photos.zip" "/tmp/holiday photos.zip"`.
+
 Downloads run in the background, so the prompt stays usable while they run.
 
 The client also takes two optional flags, used by the tests and the benchmark:
@@ -245,6 +247,5 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 * **Merging after a split is a union.** If the trackers are cut off from each other while both keep running, merging on reconnect keeps everything either side has. A deletion made during the split (a logout, a user leaving a group) can come back.
 * **A restarted tracker serves clients immediately**, possibly before the other tracker's snapshot has arrived.
 * **Passwords are stored and sent in plain text**, and a peer serves any piece it has to anyone who asks, without checking group membership.
-* **File names and paths cannot contain spaces**, because commands are space-separated.
 * **Each piece request opens a new TCP connection**, and there is no choking or tit-for-tat incentive as in BitTorrent.
 * A command retried after failover may already have been applied by the tracker that died (for example, `create_group` then reports that the group exists).

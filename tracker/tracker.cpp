@@ -131,8 +131,12 @@ void Tracker::listen_for_clients() {
 void Tracker::handle_client(int client_socket, const string& client_addr) {
     string command_str;
     while (recv_msg(client_socket, command_str)) {
-        auto args = parse(command_str, " ");
-        process_command(client_socket, client_addr, args);
+        vector<string> args;
+        if (decode_fields(command_str, args)) {
+            process_command(client_socket, client_addr, args);
+        } else {
+            send_response(client_socket, "error :  Bad arguments");
+        }
     }
 
     string user_id = get_user_id_from_socket(client_socket);
@@ -191,7 +195,7 @@ void Tracker::create_user(int sock, const vector<string>& args) {
         users[user_id] = password;
         send_response(sock, "success User created");
         log_msg("User " + user_id + " created.");
-        send_sync_message("synced_CREATE_USER " + user_id + " " + password);
+        send_sync_message(make_message({"synced_CREATE_USER", user_id, password}));
     }
 }
 
@@ -232,7 +236,7 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
     socket_to_user[sock] = user_id;
     send_response(sock, "success Login successful");
     log_msg("User " + user_id + " logged in from " + client_full_addr);
-    send_sync_message("synced_LOGIN " + user_id + " " + client_full_addr);
+    send_sync_message(make_message({"synced_LOGIN", user_id, client_full_addr}));
 }
 
 void Tracker::logout(int sock, const vector<string>& args) {
@@ -271,7 +275,7 @@ void Tracker::end_session(int sock, const string& user_id) {
     }
 
     log_msg("User " + user_id + " logged out.");
-    send_sync_message("synced_LOGOUT " + user_id + " " + user_addr);
+    send_sync_message(make_message({"synced_LOGOUT", user_id, user_addr}));
 }
 
 void Tracker::create_group(int sock, const vector<string>& args) {
@@ -299,7 +303,7 @@ void Tracker::create_group(int sock, const vector<string>& args) {
     groups[group_id] = new_group;
 
     send_response(sock, "success Group created.");
-    send_sync_message("synced_CREATE_GROUP " + group_id + " " + user_id);
+    send_sync_message(make_message({"synced_CREATE_GROUP", group_id, user_id}));
 }
 
 void Tracker::join_group(int sock, const vector<string>& args) {
@@ -327,7 +331,7 @@ void Tracker::join_group(int sock, const vector<string>& args) {
 
     group.pending_requests.insert(user_id);
     send_response(sock, "success Join request sent.");
-    send_sync_message("synced_JOIN_GROUP " + group_id + " " + user_id);
+    send_sync_message(make_message({"synced_JOIN_GROUP", group_id, user_id}));
 }
 
 void Tracker::leave_group(int sock, const vector<string>& args) {
@@ -355,7 +359,7 @@ void Tracker::leave_group(int sock, const vector<string>& args) {
     
     group.members.erase(user_id);
     send_response(sock, "success You have left the group.");
-    send_sync_message("synced_LEAVE_GROUP " + group_id + " " + user_id);
+    send_sync_message(make_message({"synced_LEAVE_GROUP", group_id, user_id}));
 }
 
 
@@ -387,7 +391,7 @@ void Tracker::list_requests(int sock, const vector<string>& args) {
         response += "No pending requests.";
     } else {
         for(const auto& req_user : group.pending_requests) {
-            response += req_user + " ";
+            response += encode_field(req_user) + " ";
         }
     }
     send_response(sock, response);
@@ -424,7 +428,7 @@ void Tracker::accept_request(int sock, const vector<string>& args) {
     group.pending_requests.erase(user_to_accept);
     group.members.insert(user_to_accept);
     send_response(sock, "success User added to group.");
-    send_sync_message("synced_ACCEPT_REQUEST " + group_id + " " + user_to_accept);
+    send_sync_message(make_message({"synced_ACCEPT_REQUEST", group_id, user_to_accept}));
 }
 
 void Tracker::list_groups(int sock) {
@@ -434,7 +438,7 @@ void Tracker::list_groups(int sock) {
         response += "No groups available.";
     } else {
         for (const auto& pair : groups) {
-            response += pair.first + " ";
+            response += encode_field(pair.first) + " ";
         }
     }
     send_response(sock, response);
@@ -467,7 +471,7 @@ void Tracker::list_files(int sock, const vector<string>& args) {
         response += "No files in this group.";
     } else {
         for (const auto& pair : files) {
-            response += pair.first + " ";
+            response += encode_field(pair.first) + " ";
         }
     }
     send_response(sock, response);
@@ -528,13 +532,10 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
     send_response(sock, "success File uploaded successfully.");
     log_msg("File " + filename + " uploaded to group " + group_id + " by " + user_id);
 
-    stringstream sync_msg_stream;
-    sync_msg_stream << "synced_UPLOAD " << group_id << " " << filename << " " << args[3] << " " << args[4];
-    for(size_t i = 5; i < args.size(); ++i) {
-        sync_msg_stream << " " << args[i];
-    }
-    sync_msg_stream << " " << client_addr;
-    send_sync_message(sync_msg_stream.str());
+    vector<string> sync_fields = args;
+    sync_fields[0] = "synced_UPLOAD";
+    sync_fields.push_back(client_addr);
+    send_sync_message(make_message(sync_fields));
 }
 
 void Tracker::download_file(int sock, const vector<string>& args) {
@@ -614,7 +615,7 @@ void Tracker::stop_share(int sock, const vector<string>& args) {
     if (groups.count(group_id) && groups.at(group_id).files.count(filename)) {
         groups.at(group_id).files.at(filename).seeders.erase(user_addr);
         send_response(sock, "success No longer sharing file.");
-        send_sync_message("synced_STOP_SHARE " + group_id + " " + filename + " " + user_addr);
+        send_sync_message(make_message({"synced_STOP_SHARE", group_id, filename, user_addr}));
     } else {
         send_response(sock, "error File or group not found.");
     }
@@ -645,7 +646,7 @@ void Tracker::i_am_seeder(int sock, const vector<string>& args) {
         groups.at(group_id).files.at(filename).seeders.insert(seeder_addr);
         log_msg("User " + user_id + " is now a seeder for " + filename);
         send_response(sock, "success Now seeding " + filename);
-        send_sync_message("synced_ADD_SEEDER " + group_id + " " + filename + " " + seeder_addr);
+        send_sync_message(make_message({"synced_ADD_SEEDER", group_id, filename, seeder_addr}));
     } else {
         send_response(sock, "error File or group not found.");
     }
@@ -746,29 +747,28 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
     unique_lock<mutex> groups_lock(groups_mutex);
 
     for (const auto& [user_id, password] : users) {
-        snapshot.push_back("synced_CREATE_USER " + user_id + " " + password);
+        snapshot.push_back(make_message({"synced_CREATE_USER", user_id, password}));
     }
     for (const auto& [user_id, addr] : logged_in_users) {
-        snapshot.push_back("synced_LOGIN " + user_id + " " + addr);
+        snapshot.push_back(make_message({"synced_LOGIN", user_id, addr}));
     }
     for (const auto& [group_id, group] : groups) {
-        snapshot.push_back("synced_CREATE_GROUP " + group_id + " " + group.owner_id);
+        snapshot.push_back(make_message({"synced_CREATE_GROUP", group_id, group.owner_id}));
         for (const auto& member : group.members) {
-            snapshot.push_back("synced_ACCEPT_REQUEST " + group_id + " " + member);
+            snapshot.push_back(make_message({"synced_ACCEPT_REQUEST", group_id, member}));
         }
         for (const auto& pending : group.pending_requests) {
-            snapshot.push_back("synced_JOIN_GROUP " + group_id + " " + pending);
+            snapshot.push_back(make_message({"synced_JOIN_GROUP", group_id, pending}));
         }
         for (const auto& [filename, file] : group.files) {
-            stringstream msg;
-            msg << "synced_UPLOAD " << group_id << " " << filename << " " << file.file_size << " " << file.file_hash;
+            vector<string> msg = {"synced_UPLOAD", group_id, filename, to_string(file.file_size), file.file_hash};
             for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
-                msg << " " << file.piece_hashes.at(i);
+                msg.push_back(file.piece_hashes.at(i));
             }
-            msg << " " << (file.seeders.empty() ? "-" : *file.seeders.begin());
-            snapshot.push_back(msg.str());
+            msg.push_back(file.seeders.empty() ? "-" : *file.seeders.begin());
+            snapshot.push_back(make_message(msg));
             for (const auto& seeder : file.seeders) {
-                snapshot.push_back("synced_ADD_SEEDER " + group_id + " " + filename + " " + seeder);
+                snapshot.push_back(make_message({"synced_ADD_SEEDER", group_id, filename, seeder}));
             }
         }
     }
@@ -794,8 +794,12 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
 void Tracker::handle_sync_connection(int sync_socket) {
     string sync_command_str;
     while (recv_msg(sync_socket, sync_command_str)) {
-        auto args = parse(sync_command_str, " ");
-        process_sync_command(args);
+        vector<string> args;
+        if (decode_fields(sync_command_str, args)) {
+            process_sync_command(args);
+        } else {
+            log_msg("Ignoring malformed sync message.");
+        }
     }
     log_msg("Connection with other tracker lost.");
     {

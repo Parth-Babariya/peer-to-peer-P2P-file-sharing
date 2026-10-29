@@ -33,6 +33,21 @@ string sha_file(const string& path);
 // Function to split a string by a delimiter
 vector<string> parse(const string& str, const string& delimiter);
 
+// A message is a list of fields separated by single spaces. A field may itself
+// contain spaces (a file name such as "my notes.txt"), so on the wire '%', spaces
+// and control characters are percent-encoded: "my%20notes.txt".
+string encode_field(const string& field);
+// Encodes each field and joins them into one message.
+string make_message(const vector<string>& fields);
+// Splits a message and decodes each field. False (and no fields) on an empty
+// field or a malformed escape.
+bool decode_fields(const string& msg, vector<string>& fields);
+
+// Splits a line typed at the prompt into words; "double quotes" keep spaces
+// inside one word. False on an unmatched quote or an empty quoted word.
+bool split_words(const string& line, vector<string>& words);
+
+
 // Log message to console with a prefix (safe to call from several threads)
 void log_msg(const string& msg);
 

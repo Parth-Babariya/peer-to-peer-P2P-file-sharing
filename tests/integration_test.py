@@ -235,6 +235,28 @@ def test_downloader_becomes_seeder(cl):
         assert f.read() == data
 
 
+def test_names_with_spaces(cl):
+    # Double quotes keep spaces in one word at the prompt; on the wire such a name
+    # is percent-encoded, so it survives the space-separated protocol.
+    a = cl.client("a", "a")
+    b = cl.client("b", "b")
+    a.cmd('create_group "my group"')
+    join(a, b, '"my group"')
+    name = "my movie 100%.bin"
+    data = write_random(cl.path(name), 2 * PIECE + 5, 14)
+    a.cmd(f'upload_file "my group" "{cl.path(name)}"')
+    b.cmd('list_files "my group"', OK + re.escape(f' "{name}"'))
+    b.cmd(f'download_file "my group" "{name}" "{cl.path("the copy.bin")}"', r"Starting download")
+    b.wait_for(re.escape(f"Download completed for {name}"), timeout=20)
+    with open(cl.path("the copy.bin"), "rb") as f:
+        assert f.read() == data
+    b.cmd("show_downloads", re.escape(f"[C] [my group] {name}"))
+    a.cmd('list_files "my group', r"Unmatched")
+    # The names crossed the sync link intact too.
+    c = cl.client("c", "c", info="trackers_rev.txt")
+    c.cmd("list_groups", OK + ' "my group"')
+
+
 def test_sync_burst(cl):
     # Thirty commands typed in one go make tracker 1 send thirty sync messages
     # back to back; tracker 2 must apply every one of them.

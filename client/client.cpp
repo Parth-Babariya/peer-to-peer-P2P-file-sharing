@@ -145,7 +145,7 @@ string Client::send_to_tracker(const string& command) {
 
     if (is_logged_in) {
         log_msg("Re-authenticating session with new tracker...");
-        string login_cmd = "login " + user_id + " " + password + " " + to_string(seeder_port);
+        string login_cmd = make_message({"login", user_id, password, to_string(seeder_port)});
         string login_response;
         if (!request_reply(login_cmd, login_response) || login_response.find("success") == string::npos) {
             log_msg("Warning: Re-login failed. You may need to login manually.");
@@ -162,10 +162,30 @@ string Client::send_to_tracker(const string& command) {
 }
 
 
+// A tracker reply as the user should see it: names in a list come percent-encoded,
+// so decode them, and quote any that contain spaces.
+static string show_reply(const string& reply) {
+    string shown;
+    auto words = parse(reply, " ");
+    for (size_t i = 0; i < words.size(); ++i) {
+        vector<string> decoded;
+        string word = words[i];
+        if (decode_fields(word, decoded) && decoded[0] != word) {
+            word = decoded[0].find(' ') == string::npos ? decoded[0] : "\"" + decoded[0] + "\"";
+        }
+        shown += (i > 0 ? " " : "") + word;
+    }
+    return shown;
+}
+
 void Client::process_user_input() {
     string line;
     while (cout << "> " && getline(cin, line)) {
-        auto args = parse(line, " ");
+        vector<string> args;
+        if (!split_words(line, args)) {
+            cout << "Unmatched or empty quotes." << endl;
+            continue;
+        }
         if (args.empty()) continue;
 
         const string& command = args[0];
@@ -180,8 +200,8 @@ void Client::process_user_input() {
         } else if (command == "show_downloads") {
             show_downloads();
         } else {
-            string response = send_to_tracker(line);
-            cout << response << endl;
+            string response = send_to_tracker(make_message(args));
+            cout << show_reply(response) << endl;
             if (command == "logout" && response.find("success") != string::npos) {
                 lock_guard<mutex> lock(tracker_mutex);
                 is_logged_in = false;
@@ -197,7 +217,7 @@ void Client::handle_login(const vector<string>& args) {
         cout << "Usage: login <user_id> <password>" << endl;
         return;
     }
-    string command = args[0] + " " + args[1] + " " + args[2] + " " + to_string(seeder_port);
+    string command = make_message({args[0], args[1], args[2], to_string(seeder_port)});
     string response = send_to_tracker(command);
     cout << response << endl;
 
@@ -262,7 +282,8 @@ void Client::handle_peer_connection(int peer_socket) {
         close(peer_socket);
         return;
     }
-    auto args = parse(request, " ");
+    vector<string> args;
+    decode_fields(request, args); // a malformed request leaves args empty and gets ""
 
     string file_path;
     if (args.size() >= 2) {
@@ -385,13 +406,10 @@ void Client::handle_upload(const vector<string>& args) {
     close(fd);
     string full_file_hash = file_hash.hex();
 
-    stringstream command_stream;
-    command_stream << "upload_file " << group_id << " " << filename << " " << file_size << " " << full_file_hash;
-    for(const auto& p_hash : piece_hashes) {
-        command_stream << " " << p_hash;
-    }
+    vector<string> command = {"upload_file", group_id, filename, to_string(file_size), full_file_hash};
+    command.insert(command.end(), piece_hashes.begin(), piece_hashes.end());
 
-    string response = send_to_tracker(command_stream.str());
+    string response = send_to_tracker(make_message(command));
     cout << response << endl;
 
     if (response.find("success") != string::npos) {
@@ -410,11 +428,10 @@ void Client::handle_download(const vector<string>& args) {
         return;
     }
 
-    string command = "download_file " + args[1] + " " + args[2];
-    string response = send_to_tracker(command);
-    
-    auto metadata = parse(response, " ");
-    if (metadata[0] == "success") {
+    string response = send_to_tracker(make_message({"download_file", args[1], args[2]}));
+
+    vector<string> metadata;
+    if (decode_fields(response, metadata) && metadata[0] == "success") {
         log_msg("Starting download for " + args[2]);
         thread downloader(&Client::download_manager, this, args[1], args[2], args[3], metadata);
         downloader.detach();
@@ -535,7 +552,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
             lock_guard<mutex> share_lock(shared_files_mutex);
             shared_files[filename] = dest_path;
         }
-        send_to_tracker("i_am_seeder " + group_id + " " + filename);
+        send_to_tracker(make_message({"i_am_seeder", group_id, filename}));
     }
 
     Swarm swarm;
@@ -556,15 +573,16 @@ void Client::download_manager(const string& group_id, const string& filename, co
         for (const auto& entry : swarm.bitfields) candidates.insert(entry.first);
         lk.unlock();
 
-        auto reply = parse(send_to_tracker("download_file " + group_id + " " + filename), " ");
-        if (reply[0] == "success") {
+        vector<string> reply;
+        if (decode_fields(send_to_tracker(make_message({"download_file", group_id, filename})), reply) &&
+            reply[0] == "success") {
             for (size_t i = seeder_start_index; i < reply.size(); ++i) candidates.insert(reply[i]);
         }
         map<string, string> found;
         set<string> unreachable;
         for (const auto& seeder : candidates) {
             string bits;
-            if (ask_peer(seeder, "have " + filename, bits)) {
+            if (ask_peer(seeder, make_message({"have", filename}), bits)) {
                 found[seeder] = bits.size() == (size_t)n ? bits : string(n, '0');
             } else {
                 unreachable.insert(seeder);
@@ -626,7 +644,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
         int sock = connect_to_peer(seeder);
         if (sock < 0) return Fetch::Bad;
         log_msg("Downloading piece " + to_string(p) + " from seeder " + seeder);
-        bool ok = send_msg(sock, "get_piece " + filename + " " + to_string(p)) && recv_msg(sock, piece);
+        bool ok = send_msg(sock, make_message({"get_piece", filename, to_string(p)})) && recv_msg(sock, piece);
         close(sock);
         if (!ok) return Fetch::Bad;
         if (piece.empty()) return Fetch::NotThere; // its bitfield was out of date
@@ -717,7 +735,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
                 lock_guard<mutex> share_lock(shared_files_mutex);
                 shared_files.erase(filename);
             }
-            send_to_tracker("stop_share " + group_id + " " + filename);
+            send_to_tracker(make_message({"stop_share", group_id, filename}));
         }
     };
     if (swarm.remaining > 0) {
@@ -738,7 +756,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
             shared_files[filename] = dest_path;
         }
         // Never hold downloads_mutex here: this waits on the network.
-        send_to_tracker("i_am_seeder " + group_id + " " + filename);
+        send_to_tracker(make_message({"i_am_seeder", group_id, filename}));
     }
 }
 
