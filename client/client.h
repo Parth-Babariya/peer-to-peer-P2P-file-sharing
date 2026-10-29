@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <utility>
 
 using namespace std;
 
@@ -69,10 +70,11 @@ private:
     string user_id;
     string password;
 
-    map<string, DownloadState> ongoing_downloads; // filename -> state
+    // Both keyed by (group, file name): two groups may each have a file of the same name.
+    map<pair<string, string>, DownloadState> ongoing_downloads;
     mutex downloads_mutex;
 
-    map<string, SharedFile> shared_files; // filename -> where it is, and its key
+    map<pair<string, string>, SharedFile> shared_files;
     mutex shared_files_mutex;
 
     bool partial_sharing;

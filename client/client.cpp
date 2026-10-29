@@ -272,8 +272,8 @@ void Client::start_seeder_service(int seeder_socket) {
 }
 
 // Serves two requests from peers, one per connection:
-//   have <file> <key>          -> one char per piece, '1' if we can serve it ("" if not sharing)
-//   get_piece <file> <key> <i> -> the piece's bytes ("" if we can't serve it)
+//   have <group> <file> <key>          -> one char per piece, '1' if we can serve it ("" if not sharing)
+//   get_piece <group> <file> <key> <i> -> the piece's bytes ("" if we can't serve it)
 // The key is the file's share key: the tracker gives it only to members of the
 // file's group, so a peer that doesn't have it gets nothing. A file still
 // downloading is served piece by piece, but only pieces already written and
@@ -288,10 +288,12 @@ void Client::handle_peer_connection(int peer_socket) {
     decode_fields(request, args); // a malformed request leaves args empty and gets ""
 
     string file_path;
-    if (args.size() >= 3) {
+    pair<string, string> file_id;
+    if (args.size() >= 4) {
+        file_id = {args[1], args[2]};
         lock_guard<mutex> lock(shared_files_mutex);
-        auto it = shared_files.find(args[1]);
-        if (it != shared_files.end() && same_secret(args[2], it->second.key)) file_path = it->second.path;
+        auto it = shared_files.find(file_id);
+        if (it != shared_files.end() && same_secret(args[3], it->second.key)) file_path = it->second.path;
     }
 
     // Pieces we hold, or empty if the file is complete (then we hold all of them).
@@ -299,14 +301,14 @@ void Client::handle_peer_connection(int peer_socket) {
     vector<bool> held;
     if (!file_path.empty()) {
         lock_guard<mutex> lock(downloads_mutex);
-        auto it = ongoing_downloads.find(args[1]);
+        auto it = ongoing_downloads.find(file_id);
         if (it != ongoing_downloads.end() && it->second.status != "Completed") {
             partial = true;
             held = it->second.pieces_downloaded;
         }
     }
 
-    if (args.size() == 3 && args[0] == "have") {
+    if (args.size() == 4 && args[0] == "have") {
         string bits;
         if (partial) {
             for (bool b : held) bits += b ? '1' : '0';
@@ -323,10 +325,10 @@ void Client::handle_peer_connection(int peer_socket) {
 
     string piece;
     // Peers are untrusted: the index must be a plain non-negative number.
-    bool valid = args.size() == 4 && args[0] == "get_piece" && !args[3].empty() && args[3].size() <= 9 &&
-                 all_of(args[3].begin(), args[3].end(), ::isdigit);
+    bool valid = args.size() == 5 && args[0] == "get_piece" && !args[4].empty() && args[4].size() <= 9 &&
+                 all_of(args[4].begin(), args[4].end(), ::isdigit);
     if (valid && !file_path.empty()) {
-        long piece_index = stol(args[3]);
+        long piece_index = stol(args[4]);
         bool have_it = !partial || (piece_index < (long)held.size() && held[piece_index]);
         int fd = have_it ? open(file_path.c_str(), O_RDONLY) : -1;
         if (fd != -1) {
@@ -417,7 +419,7 @@ void Client::handle_upload(const vector<string>& args) {
 
     if (response.find("success") != string::npos) {
         lock_guard<mutex> lock(shared_files_mutex);
-        shared_files[filename] = {file_path, share_key};
+        shared_files[{group_id, filename}] = {file_path, share_key};
     }
 }
 
@@ -504,7 +506,7 @@ struct Swarm {
 void Client::download_manager(const string& group_id, const string& filename, const string& dest_path, const vector<string>& metadata) {
     auto set_status = [&](const string& status) {
         lock_guard<mutex> lock(downloads_mutex);
-        ongoing_downloads[filename].status = status;
+        ongoing_downloads[{group_id, filename}].status = status;
     };
 
     // metadata: success <file_size> <file_hash> <share_key> <piece_hash>... <seeder>...
@@ -524,7 +526,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
         log_msg("Malformed file info from tracker. Download failed for " + filename);
         lock_guard<mutex> lock(downloads_mutex);
         state.status = "Failed";
-        ongoing_downloads[filename] = state;
+        ongoing_downloads[{group_id, filename}] = state;
         return;
     }
     const string& file_hash = metadata[2];
@@ -537,7 +539,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
 
     {
         lock_guard<mutex> lock(downloads_mutex);
-        ongoing_downloads[filename] = state;
+        ongoing_downloads[{group_id, filename}] = state;
     }
 
     // Full size up front, so pieces can be written in any order.
@@ -554,7 +556,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
     if (partial_sharing) {
         {
             lock_guard<mutex> share_lock(shared_files_mutex);
-            shared_files[filename] = {dest_path, share_key};
+            shared_files[{group_id, filename}] = {dest_path, share_key};
         }
         send_to_tracker(make_message({"i_am_seeder", group_id, filename}));
     }
@@ -586,7 +588,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
         set<string> unreachable;
         for (const auto& seeder : candidates) {
             string bits;
-            if (ask_peer(seeder, make_message({"have", filename, share_key}), bits)) {
+            if (ask_peer(seeder, make_message({"have", group_id, filename, share_key}), bits)) {
                 found[seeder] = bits.size() == (size_t)n ? bits : string(n, '0');
             } else {
                 unreachable.insert(seeder);
@@ -648,7 +650,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
         int sock = connect_to_peer(seeder);
         if (sock < 0) return Fetch::Bad;
         log_msg("Downloading piece " + to_string(p) + " from seeder " + seeder);
-        bool ok = send_msg(sock, make_message({"get_piece", filename, share_key, to_string(p)})) && recv_msg(sock, piece);
+        bool ok = send_msg(sock, make_message({"get_piece", group_id, filename, share_key, to_string(p)})) && recv_msg(sock, piece);
         close(sock);
         if (!ok) return Fetch::Bad;
         if (piece.empty()) return Fetch::NotThere; // its bitfield was out of date
@@ -706,7 +708,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
                 swarm.remaining--;
                 swarm.fruitless_refreshes = 0;
                 lock_guard<mutex> lock(downloads_mutex);
-                ongoing_downloads[filename].pieces_downloaded[p] = true;
+                ongoing_downloads[{group_id, filename}].pieces_downloaded[p] = true;
             } else if (result == Fetch::Ok) {
                 log_msg("Write to " + dest_path + " failed.");
                 swarm.failed = true;
@@ -737,7 +739,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
         if (partial_sharing) {
             {
                 lock_guard<mutex> share_lock(shared_files_mutex);
-                shared_files.erase(filename);
+                shared_files.erase({group_id, filename});
             }
             send_to_tracker(make_message({"stop_share", group_id, filename}));
         }
@@ -757,7 +759,7 @@ void Client::download_manager(const string& group_id, const string& filename, co
     if (!partial_sharing) {
         {
             lock_guard<mutex> share_lock(shared_files_mutex);
-            shared_files[filename] = {dest_path, share_key};
+            shared_files[{group_id, filename}] = {dest_path, share_key};
         }
         // Never hold downloads_mutex here: this waits on the network.
         send_to_tracker(make_message({"i_am_seeder", group_id, filename}));

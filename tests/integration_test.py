@@ -268,6 +268,32 @@ def test_names_with_spaces(cl):
     c.cmd("list_groups", OK + ' "my group"')
 
 
+def test_same_name_in_two_groups(cl):
+    # One client shares a different "f.bin" in each of two groups; each group's
+    # downloaders must get that group's file.
+    a = cl.client("a", "a")
+    b = cl.client("b", "b")
+    os.makedirs(cl.path("one"))
+    os.makedirs(cl.path("two"))
+    data = {}
+    for g, d, seed in [("g1", "one", 16), ("g2", "two", 17)]:
+        a.cmd(f"create_group {g}")
+        join(a, b, g)
+        data[g] = write_random(cl.path(f"{d}/f.bin"), PIECE + 3, seed)
+        a.cmd(f"upload_file {g} {cl.path(d + '/f.bin')}")
+    for g in ["g1", "g2"]:
+        b.cmd(f"download_file {g} f.bin {cl.path(g + '.bin')}", r"Starting download")
+    deadline = time.monotonic() + 20
+    while sum("Download completed for f.bin" in l for l in b.lines) < 2:
+        assert not any("Download failed" in l for l in b.lines), "a download failed"
+        assert time.monotonic() < deadline, "downloads did not finish"
+        time.sleep(0.1)
+    for g in ["g1", "g2"]:
+        with open(cl.path(g + ".bin"), "rb") as f:
+            assert f.read() == data[g], f"{g} got the other group's file"
+    b.cmd("show_downloads", r"\[C\] \[g2\] f.bin")
+
+
 def test_sync_burst(cl):
     # Thirty commands typed in one go make tracker 1 send thirty sync messages
     # back to back; tracker 2 must apply every one of them.
@@ -421,7 +447,7 @@ def test_seeder_requires_the_share_key(cl):
         with socket.create_connection(("127.0.0.1", a.seeder_port), timeout=5) as s:
             return ask(cl.args, s, line, binary)
 
-    for line in ["have f.bin", "get_piece f.bin 0", f"have f.bin {'0' * 32}", f"get_piece f.bin {'0' * 32} 0"]:
+    for line in ["have g f.bin", "get_piece g f.bin 0", f"have g f.bin {'0' * 32}", f"get_piece g f.bin {'0' * 32} 0"]:
         assert from_seeder(line) == "", f"seeder answered {line!r} without the key"
 
     with socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5) as t:
@@ -434,8 +460,8 @@ def test_seeder_requires_the_share_key(cl):
         reply = ask(cl.args, t, "download_file g f.bin").split(" ")
     assert reply[0] == "success", reply
     key = reply[3]
-    assert from_seeder(f"have f.bin {key}") == "11"
-    assert from_seeder(f"get_piece f.bin {key} 1", binary=True) == data[PIECE:]
+    assert from_seeder(f"have g f.bin {key}") == "11"
+    assert from_seeder(f"get_piece g f.bin {key} 1", binary=True) == data[PIECE:]
 
 
 def test_tracker_survives_garbage(cl):
