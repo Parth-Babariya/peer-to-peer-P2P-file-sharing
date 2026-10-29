@@ -2,11 +2,12 @@
 CXX = g++
 
 # Compiler flags:
-# -std=c++11: Use the C++11 standard
+# -std=c++17: Use the C++17 standard
+# -I../common: Shared code (framing, hashing) used by both programs
 # -pthread: Enable support for POSIX threads
 # -Wall -Wextra: Enable all common and extra warnings for better code quality
 # -g: Include debugging information in the executable
-CXXFLAGS = -std=c++11 -pthread -Wall -Wextra -g
+CXXFLAGS = -std=c++17 -I../common -pthread -Wall -Wextra -g
 
 # Linker flags:
 # -lssl -lcrypto: Link against the OpenSSL libraries for SHA1 hashing functions
@@ -16,7 +17,7 @@ LDFLAGS = -lssl -lcrypto
 TARGET = tracker
 
 # All source files that need to be compiled
-SOURCES = tracker.cpp utils.cpp
+SOURCES = tracker.cpp ../common/utils.cpp
 
 # Object files are derived from source files (e.g., tracker.cpp -> tracker.o)
 OBJECTS = $(SOURCES:.cpp=.o)

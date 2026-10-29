@@ -12,10 +12,8 @@
 
 using namespace std;
 
-#define size_piece 512*1024
-
 void send_response(int sock, const string& msg) {
-    send(sock, msg.c_str(), msg.length(), 0);
+    send_msg(sock, msg);
 }
 
 Tracker::Tracker(const string& info_file, int tracker_num) : tracker_id(tracker_num) {
@@ -127,14 +125,10 @@ void Tracker::listen_for_clients() {
 }
 
 void Tracker::handle_client(int client_socket, const string& client_addr) {
-    char buffer[size_piece] = {0};
-    while (read(client_socket, buffer, size_piece) > 0) {
-        string command_str(buffer);
+    string command_str;
+    while (recv_msg(client_socket, command_str)) {
         auto args = parse(command_str, " ");
-        if (!args.empty()) {
-            process_command(client_socket, client_addr, args);
-        }
-        memset(buffer, 0, size_piece);
+        process_command(client_socket, client_addr, args);
     }
 
     string user_id = get_user_id_from_socket(client_socket);
@@ -680,14 +674,10 @@ void Tracker::connect_to_other_tracker() {
 }
 
 void Tracker::handle_sync_connection(int sync_socket) {
-    char buffer[size_piece] = {0};
-    while (read(sync_socket, buffer, size_piece) > 0) {
-        string sync_command_str(buffer);
+    string sync_command_str;
+    while (recv_msg(sync_socket, sync_command_str)) {
         auto args = parse(sync_command_str, " ");
-        if (!args.empty()) {
-            process_sync_command(args);
-        }
-        memset(buffer, 0, size_piece);
+        process_sync_command(args);
     }
     log_msg("Connection with other tracker lost.");
     {
@@ -702,7 +692,7 @@ void Tracker::handle_sync_connection(int sync_socket) {
 void Tracker::send_sync_message(const string& message) {
     lock_guard<mutex> lock(other_tracker_socket_mutex);
     if (other_tracker_socket != -1) {
-        if(send(other_tracker_socket, message.c_str(), message.length(), 0) < 0) {
+        if (!send_msg(other_tracker_socket, message)) {
             log_msg("Failed to send sync message. Other tracker may be down.");
             close(other_tracker_socket);
             other_tracker_socket = -1;

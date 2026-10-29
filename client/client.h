@@ -9,8 +9,6 @@
 
 using namespace std;
 
-const int PIECE_SIZE = 512 * 1024; // 512KB
-
 struct DownloadState {
     string group_id;
     string filename;

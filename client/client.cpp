@@ -8,11 +8,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <random>
-#include <iomanip>
-#include <openssl/sha.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#define MSG_SIZE 512*1024
 
 using namespace std;
 
@@ -139,16 +136,9 @@ string Client::send_to_tracker(const string& command, bool is_retry) {
             log_msg("Re-authenticating session with new tracker...");
             string login_cmd = "login " + user_id + " " + password + " " + to_string(seeder_port);
             
-            send(tracker_socket, login_cmd.c_str(), login_cmd.length(), 0);
-            
-            // --- FIX: Allocate buffer on HEAP ---
-            char* login_buffer = new char[MSG_SIZE];
-            memset(login_buffer, 0, MSG_SIZE);
-            read(tracker_socket, login_buffer, MSG_SIZE);
-            string login_response(login_buffer);
-            delete[] login_buffer; // Clean up memory
-
-            if(login_response.find("success") == string::npos) {
+            string login_response;
+            if (!send_msg(tracker_socket, login_cmd) || !recv_msg(tracker_socket, login_response) ||
+                login_response.find("success") == string::npos) {
                 log_msg("Warning: Re-login failed. You may need to login manually.");
                 is_logged_in = false;
             } else {
@@ -159,22 +149,10 @@ string Client::send_to_tracker(const string& command, bool is_retry) {
         return send_to_tracker(command, true);
     };
 
-    if (send(tracker_socket, command.c_str(), command.length(), 0) < 0) {
+    string response;
+    if (!send_msg(tracker_socket, command) || !recv_msg(tracker_socket, response)) {
         return attempt_failover_and_retry();
     }
-
-    // --- FIX: Allocate buffer on HEAP ---
-    char* buffer = new char[MSG_SIZE];
-    memset(buffer, 0, MSG_SIZE);
-    ssize_t bytes_read = read(tracker_socket, buffer, MSG_SIZE);
-    
-    if (bytes_read <= 0) {
-        delete[] buffer; // Clean up memory on error
-        return attempt_failover_and_retry();
-    }
-
-    string response(buffer);
-    delete[] buffer; // Clean up memory
     return response;
 }
 
@@ -255,10 +233,15 @@ void Client::start_seeder_service() {
 }
 
 void Client::handle_peer_connection(int peer_socket) {
-    char buffer[1024] = {0};
-    read(peer_socket, buffer, 1024);
-    
-    auto args = parse(string(buffer), " ");
+    string request;
+    if (!recv_msg(peer_socket, request)) {
+        close(peer_socket);
+        return;
+    }
+
+    // The reply is always one message: the piece's bytes, or empty if we can't serve it.
+    string piece;
+    auto args = parse(request, " ");
     if (args.size() == 3 && args[0] == "get_piece") {
         const string& filename = args[1];
         int piece_index = stoi(args[2]);
@@ -274,20 +257,14 @@ void Client::handle_peer_connection(int peer_socket) {
         if (!file_path.empty()) {
             int fd = open(file_path.c_str(), O_RDONLY);
             if (fd != -1) {
-                lseek(fd, (long long)piece_index * PIECE_SIZE, SEEK_SET);
-                
-                // --- FIX: Allocate buffer on HEAP ---
-                char* piece_buffer = new char[PIECE_SIZE];
-                ssize_t bytes_read = read(fd, piece_buffer, PIECE_SIZE);
-                
-                if (bytes_read > 0) {
-                    send(peer_socket, piece_buffer, bytes_read, 0);
-                }
-                delete[] piece_buffer; // Clean up memory
+                piece.resize(PIECE_SIZE);
+                ssize_t bytes_read = pread(fd, &piece[0], PIECE_SIZE, (off_t)piece_index * PIECE_SIZE);
+                piece.resize(bytes_read > 0 ? bytes_read : 0);
                 close(fd);
             }
         }
     }
+    send_msg(peer_socket, piece);
     close(peer_socket);
 }
 
@@ -320,30 +297,17 @@ void Client::handle_upload(const vector<string>& args) {
     long long file_size = file_stat.st_size;
 
     vector<string> piece_hashes;
-    // --- FIX: Allocate buffer on HEAP ---
-    char* piece_buffer = new char[PIECE_SIZE];
-
-    SHA_CTX sha_context;
-    SHA1_Init(&sha_context);
+    vector<char> piece_buffer(PIECE_SIZE);
+    Sha1 file_hash;
 
     ssize_t bytes_read;
-    while((bytes_read = read(fd, piece_buffer, PIECE_SIZE)) > 0) {
-        piece_hashes.push_back(sha(piece_buffer, bytes_read));
-        SHA1_Update(&sha_context, piece_buffer, bytes_read);
+    while((bytes_read = read(fd, piece_buffer.data(), PIECE_SIZE)) > 0) {
+        piece_hashes.push_back(sha(piece_buffer.data(), bytes_read));
+        file_hash.update(piece_buffer.data(), bytes_read);
     }
     close(fd);
-    delete[] piece_buffer; // Clean up memory
+    string full_file_hash = file_hash.hex();
 
-    unsigned char full_hash_raw[SHA_DIGEST_LENGTH];
-    SHA1_Final(full_hash_raw, &sha_context);
-
-    stringstream ss;
-    ss << hex << setfill('0');
-    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i) {
-        ss << setw(2) << static_cast<unsigned int>(full_hash_raw[i]);
-    }
-    string full_file_hash = ss.str();
-    
     stringstream command_stream;
     command_stream << "upload_file " << group_id << " " << filename << " " << file_size << " " << full_file_hash;
     for(const auto& p_hash : piece_hashes) {
@@ -424,9 +388,6 @@ void Client::download_manager(const string& group_id, const string& filename, co
         return;
     }
 
-    // --- CRITICAL FIX: Allocate buffer on the HEAP ---
-    char* piece_buf = new char[PIECE_SIZE];
-
     int pieces_to_get = state.total_pieces;
     int seeder_idx = 0;
     
@@ -438,7 +399,6 @@ void Client::download_manager(const string& group_id, const string& filename, co
                  lock_guard<mutex> lock(downloads_mutex);
                  ongoing_downloads[filename].status = "Failed";
                  close(fd);
-                 delete[] piece_buf; // Clean up memory on error
                  return;
             }
             string seeder_addr = seeders[seeder_idx % seeders.size()];
@@ -463,32 +423,13 @@ void Client::download_manager(const string& group_id, const string& filename, co
             log_msg("Downloading piece " + to_string(i) + " from seeder " + seeder_addr);
 
             string request = "get_piece " + filename + " " + to_string(i);
-            send(peer_sock, request.c_str(), request.length(), 0);
-            
-            long long piece_size_to_expect = PIECE_SIZE;
-            if (i == state.total_pieces - 1) {
-                piece_size_to_expect = state.file_size % PIECE_SIZE;
-                if (piece_size_to_expect == 0) {
-                    piece_size_to_expect = PIECE_SIZE;
-                }
-            }
-            
-            long long total_bytes_read = 0;
-            while (total_bytes_read < piece_size_to_expect) {
-                ssize_t bytes_read_now = read(peer_sock, piece_buf + total_bytes_read, piece_size_to_expect - total_bytes_read);
-                if (bytes_read_now <= 0) {
-                    log_msg("Seeder disconnected while reading piece " + to_string(i));
-                    total_bytes_read = -1;
-                    break;
-                }
-                total_bytes_read += bytes_read_now;
-            }
-
-            if (total_bytes_read > 0) {
-                string received_hash = sha(piece_buf, total_bytes_read);
+            string piece;
+            if (!send_msg(peer_sock, request) || !recv_msg(peer_sock, piece)) {
+                log_msg("Seeder disconnected while reading piece " + to_string(i));
+            } else {
+                string received_hash = sha(piece.data(), piece.size());
                 if (received_hash == state.piece_hashes[i]) {
-                    lseek(fd, (long long)i * PIECE_SIZE, SEEK_SET);
-                    write(fd, piece_buf, total_bytes_read);
+                    pwrite(fd, piece.data(), piece.size(), (off_t)i * PIECE_SIZE);
                     
                     piece_ok = true;
                     pieces_to_get--;
@@ -504,7 +445,6 @@ void Client::download_manager(const string& group_id, const string& filename, co
     }
 
     close(fd);
-    delete[] piece_buf; // Clean up memory on success
 
     if (pieces_to_get == 0) {
         log_msg("Download completed for " + filename);
