@@ -580,6 +580,45 @@ def test_retried_command_runs_once(cl):
     s2.close()
 
 
+def split(cl):
+    """Cuts the sync link (tracker 1 stops dialling) until heal()."""
+    m = cl.t2.mark()
+    cl.t1.send("disconnect")
+    cl.t2.wait_for("Connection with other tracker lost", m)
+
+
+def heal(cl):
+    marks = cl.t1.mark(), cl.t2.mark()
+    cl.t1.send("reconnect")
+    for t, m in zip((cl.t1, cl.t2), marks):
+        t.wait_for("Caught up with other tracker", m)
+
+
+def test_split_does_not_undo_removals(cl):
+    # While the trackers can't reach each other, b leaves the group and a stops
+    # sharing a file, both on tracker 1; tracker 2 still has the older state.
+    # After the merge, those removals must stand on both trackers, and a change
+    # made only on tracker 2 must reach tracker 1.
+    a = cl.client("a", "a", group="g")
+    b = cl.client("b", "b")
+    e = cl.client("e", "e")
+    join(a, b, "g")
+    join(a, e, "g")
+    write_random(cl.path("f.bin"), 1000, 18)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    split(cl)
+    b.cmd("leave_group g")
+    a.cmd("stop_share g f.bin")
+    c = cl.client("c", "c", info="trackers_rev.txt")
+    c.cmd("create_group made_on_2")
+    heal(cl)
+    b.cmd("list_files g", ERR)
+    b.cmd("list_groups", OK + r" .*made_on_2")
+    cl.t1.kill()  # from here on, tracker 2 answers
+    b.cmd("list_files g", ERR)
+    e.cmd("download_file g f.bin " + cl.path("e.bin"), r"No seeders")
+
+
 def test_failover_keeps_session(cl):
     a = cl.client("a", "a", group="g")
     cl.t1.kill()

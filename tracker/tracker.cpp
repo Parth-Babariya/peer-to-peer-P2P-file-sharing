@@ -107,6 +107,15 @@ void Tracker::start() {
             // Skip static destructors: client and sync threads are still running.
             cout.flush();
             _exit(0);
+        } else if (command == "disconnect") {
+            // Cut the sync link and keep it down, as a network split would.
+            sync_enabled = false;
+            lock_guard<mutex> lock(other_tracker_socket_mutex);
+            if (other_tracker_socket != -1) shutdown(other_tracker_socket, SHUT_RDWR);
+            log_msg("Sync link disabled.");
+        } else if (command == "reconnect") {
+            sync_enabled = true;
+            log_msg("Sync link enabled.");
         }
     }
     // stdin closed (e.g. running in the background): keep serving.
@@ -258,13 +267,14 @@ void Tracker::create_user(int sock, const vector<string>& args) {
     string record = hash_password(args[2]);
 
     lock_guard<mutex> lock(users_mutex);
-    if (users.count(user_id)) {
+    if (users.contains(user_id)) {
         send_response(sock, "error : User already exists");
     } else {
-        users[user_id] = record;
+        Stamp stamp = next_stamp();
+        users.apply(user_id, true, record, stamp);
         send_response(sock, "success User created");
         log_msg("User " + user_id + " created.");
-        send_sync_message(make_message({"synced_CREATE_USER", user_id, record}));
+        send_sync_message(make_message({"synced_USER", user_id, record, stamp.str()}));
     }
 }
 
@@ -280,8 +290,7 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
     string record;
     {
         lock_guard<mutex> lock(users_mutex);
-        auto it = users.find(user_id);
-        if (it != users.end()) record = it->second;
+        record = users.value(user_id);
     }
     // Slow on purpose, so no lock is held. An unknown user is checked against a
     // dummy record, so the reply time doesn't reveal which user ids exist.
@@ -295,7 +304,7 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
     lock_guard<mutex> session_lock(logged_in_users_mutex);
     lock_guard<mutex> socket_lock(socket_to_user_mutex);
 
-    if (logged_in_users.count(user_id)) {
+    if (logged_in_users.contains(user_id)) {
         log_msg("User " + user_id + " is re-establishing session from a new connection.");
         int old_sock = -1;
         for(auto const& [key_sock, val_user] : socket_to_user) {
@@ -310,11 +319,12 @@ void Tracker::login(int sock, const string& client_addr_str, const vector<string
     }
 
     string client_full_addr = client_addr_str + ":" + client_port;
-    logged_in_users[user_id] = client_full_addr;
+    Stamp stamp = next_stamp();
+    logged_in_users.apply(user_id, true, client_full_addr, stamp);
     socket_to_user[sock] = user_id;
     send_response(sock, "success Login successful");
     log_msg("User " + user_id + " logged in from " + client_full_addr);
-    send_sync_message(make_message({"synced_LOGIN", user_id, client_full_addr}));
+    send_sync_message(make_message({"synced_SESSION", user_id, "1", client_full_addr, stamp.str()}));
 }
 
 void Tracker::logout(int sock, const vector<string>& args) {
@@ -339,21 +349,25 @@ void Tracker::end_session(int sock, const string& user_id) {
     {
         lock_guard<mutex> session_lock(logged_in_users_mutex);
         lock_guard<mutex> socket_lock(socket_to_user_mutex);
-        logged_in_users.erase(user_id);
+        Stamp stamp = next_stamp();
+        logged_in_users.apply(user_id, false, "", stamp);
         socket_to_user.erase(sock);
+        send_sync_message(make_message({"synced_SESSION", user_id, "0", "-", stamp.str()}));
     }
-    
-    {
+
+    if (!user_addr.empty()) {
         lock_guard<mutex> group_lock(groups_mutex);
+        Stamp stamp = next_stamp();
         for (auto& group_pair : groups) {
             for (auto& file_pair : group_pair.second.files) {
-                file_pair.second.seeders.erase(user_addr);
+                if (file_pair.second.seeders.contains(user_addr)) {
+                    set_seeder(group_pair.second, file_pair.second, user_addr, false, stamp);
+                }
             }
         }
     }
 
     log_msg("User " + user_id + " logged out.");
-    send_sync_message(make_message({"synced_LOGOUT", user_id, user_addr}));
 }
 
 void Tracker::create_group(int sock, const vector<string>& args) {
@@ -374,14 +388,15 @@ void Tracker::create_group(int sock, const vector<string>& args) {
         return;
     }
 
-    Group new_group;
-    new_group.group_id = group_id;
-    new_group.owner_id = user_id;
-    new_group.members.insert(user_id);
-    groups[group_id] = new_group;
+    Stamp stamp = next_stamp();
+    Group& group = groups[group_id];
+    group.group_id = group_id;
+    group.owner_id = user_id;
+    group.owner_stamp = stamp;
+    send_sync_message(make_message({"synced_GROUP", group_id, user_id, stamp.str()}));
+    set_member(group, user_id, true, stamp);
 
     send_response(sock, "success Group created.");
-    send_sync_message(make_message({"synced_CREATE_GROUP", group_id, user_id}));
 }
 
 void Tracker::join_group(int sock, const vector<string>& args) {
@@ -402,14 +417,13 @@ void Tracker::join_group(int sock, const vector<string>& args) {
         return;
     }
     Group& group = groups.at(group_id);
-    if(group.members.count(user_id)) {
+    if(group.members.contains(user_id)) {
         send_response(sock, "error :  You are already a member.");
         return;
     }
 
-    group.pending_requests.insert(user_id);
+    set_pending(group, user_id, true, next_stamp());
     send_response(sock, "success Join request sent.");
-    send_sync_message(make_message({"synced_JOIN_GROUP", group_id, user_id}));
 }
 
 void Tracker::leave_group(int sock, const vector<string>& args) {
@@ -430,14 +444,13 @@ void Tracker::leave_group(int sock, const vector<string>& args) {
         return;
     }
     Group& group = groups.at(group_id);
-    if(!group.members.count(user_id)) {
+    if(!group.members.contains(user_id)) {
         send_response(sock, "error :  You are not a member of this group.");
         return;
     }
-    
-    group.members.erase(user_id);
+
+    set_member(group, user_id, false, next_stamp());
     send_response(sock, "success You have left the group.");
-    send_sync_message(make_message({"synced_LEAVE_GROUP", group_id, user_id}));
 }
 
 
@@ -468,7 +481,7 @@ void Tracker::list_requests(int sock, const vector<string>& args) {
     if(group.pending_requests.empty()) {
         response += "No pending requests.";
     } else {
-        for(const auto& req_user : group.pending_requests) {
+        for(const auto& req_user : group.pending_requests.keys()) {
             response += encode_field(req_user) + " ";
         }
     }
@@ -498,15 +511,15 @@ void Tracker::accept_request(int sock, const vector<string>& args) {
         send_response(sock, "error :  You are not the owner of this group.");
         return;
     }
-    if (!group.pending_requests.count(user_to_accept)) {
+    if (!group.pending_requests.contains(user_to_accept)) {
         send_response(sock, "error :  This user has not requested to join.");
         return;
     }
 
-    group.pending_requests.erase(user_to_accept);
-    group.members.insert(user_to_accept);
+    Stamp stamp = next_stamp();
+    set_pending(group, user_to_accept, false, stamp);
+    set_member(group, user_to_accept, true, stamp);
     send_response(sock, "success User added to group.");
-    send_sync_message(make_message({"synced_ACCEPT_REQUEST", group_id, user_to_accept}));
 }
 
 void Tracker::list_groups(int sock) {
@@ -539,7 +552,7 @@ void Tracker::list_files(int sock, const vector<string>& args) {
         send_response(sock, "error :  Group does not exist.");
         return;
     }
-    if (!groups.at(group_id).members.count(user_id)) {
+    if (!groups.at(group_id).members.contains(user_id)) {
         send_response(sock, "error :  Not a member of this group.");
         return;
     }
@@ -590,41 +603,46 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
     }
 
     Group& group = groups.at(group_id);
-    if (group.members.find(user_id) == group.members.end()) {
+    if (!group.members.contains(user_id)) {
         send_response(sock, "error :  You are not a member of this group.");
         return;
     }
-    
-    FileInfo new_file;
-    new_file.filename = filename;
-    new_file.file_size = stoll(args[3]);
-    new_file.file_hash = args[4];
-    new_file.share_key = args[5];
-    if (!is_share_key(new_file.share_key)) {
+
+    long long file_size = stoll(args[3]);
+    if (!is_share_key(args[5])) {
         send_response(sock, "error :  Malformed share key.");
         return;
     }
-    long long expected_pieces = (new_file.file_size + PIECE_SIZE - 1) / PIECE_SIZE;
-    if (new_file.file_size < 0 || (long long)args.size() - 6 != expected_pieces) {
+    long long expected_pieces = (file_size + PIECE_SIZE - 1) / PIECE_SIZE;
+    if (file_size < 0 || (long long)args.size() - 6 != expected_pieces) {
         send_response(sock, "error :  Piece hash count does not match the file size.");
         return;
     }
 
+    Stamp stamp = next_stamp();
+    FileInfo& file = group.files[filename];
+    file.filename = filename;
+    file.file_size = file_size;
+    file.file_hash = args[4];
+    file.share_key = args[5];
+    file.piece_hashes.clear();
     for (size_t i = 6; i < args.size(); ++i) {
-        new_file.piece_hashes[i-6] = args[i];
+        file.piece_hashes[i-6] = args[i];
     }
+    file.stamp = stamp;
+    vector<string> sync_fields = args;
+    sync_fields[0] = "synced_FILE";
+    sync_fields.push_back(stamp.str());
+    send_sync_message(make_message(sync_fields));
 
-    new_file.seeders.insert(client_addr);
+    // A re-upload replaces the file, so whoever seeded the old one stops counting.
+    for (const auto& addr : file.seeders.keys()) {
+        if (addr != client_addr) set_seeder(group, file, addr, false, stamp);
+    }
+    set_seeder(group, file, client_addr, true, stamp);
 
-    group.files[filename] = new_file;
-    
     send_response(sock, "success File uploaded successfully.");
     log_msg("File " + filename + " uploaded to group " + group_id + " by " + user_id);
-
-    vector<string> sync_fields = args;
-    sync_fields[0] = "synced_UPLOAD";
-    sync_fields.push_back(client_addr);
-    send_sync_message(make_message(sync_fields));
 }
 
 void Tracker::download_file(int sock, const vector<string>& args) {
@@ -649,7 +667,7 @@ void Tracker::download_file(int sock, const vector<string>& args) {
         return;
     }
     Group& group = groups.at(group_id);
-    if (!group.members.count(user_id)) {
+    if (!group.members.contains(user_id)) {
         send_response(sock, "error :  Not a member of this group.");
         return;
     }
@@ -660,7 +678,7 @@ void Tracker::download_file(int sock, const vector<string>& args) {
 
     FileInfo& file = group.files.at(filename);
     vector<string> seeders;
-    for (const auto& seeder : file.seeders) {
+    for (const auto& seeder : file.seeders.keys()) {
         if (seeder != requester_addr) seeders.push_back(seeder);
     }
     if (seeders.empty()) {
@@ -703,9 +721,10 @@ void Tracker::stop_share(int sock, const vector<string>& args) {
     
     lock_guard<mutex> lock(groups_mutex);
     if (groups.count(group_id) && groups.at(group_id).files.count(filename)) {
-        groups.at(group_id).files.at(filename).seeders.erase(user_addr);
+        Group& group = groups.at(group_id);
+        FileInfo& file = group.files.at(filename);
+        if (file.seeders.contains(user_addr)) set_seeder(group, file, user_addr, false, next_stamp());
         send_response(sock, "success No longer sharing file.");
-        send_sync_message(make_message({"synced_STOP_SHARE", group_id, filename, user_addr}));
     } else {
         send_response(sock, "error File or group not found.");
     }
@@ -733,10 +752,10 @@ void Tracker::i_am_seeder(int sock, const vector<string>& args) {
 
     lock_guard<mutex> lock(groups_mutex);
     if(groups.count(group_id) && groups.at(group_id).files.count(filename)) {
-        groups.at(group_id).files.at(filename).seeders.insert(seeder_addr);
+        Group& group = groups.at(group_id);
+        set_seeder(group, group.files.at(filename), seeder_addr, true, next_stamp());
         log_msg("User " + user_id + " is now a seeder for " + filename);
         send_response(sock, "success Now seeding " + filename);
-        send_sync_message(make_message({"synced_ADD_SEEDER", group_id, filename, seeder_addr}));
     } else {
         send_response(sock, "error File or group not found.");
     }
@@ -753,10 +772,37 @@ string Tracker::get_user_id_from_socket(int sock) {
 
 string Tracker::get_address_from_user_id(const string& user_id) {
     lock_guard<mutex> lock(logged_in_users_mutex);
-    if(logged_in_users.count(user_id)) {
-        return logged_in_users.at(user_id);
+    return logged_in_users.value(user_id);
+}
+
+Stamp Tracker::next_stamp() {
+    Stamp stamp;
+    stamp.counter = ++clock;
+    stamp.tracker = tracker_id;
+    return stamp;
+}
+
+void Tracker::observe(const Stamp& stamp) {
+    unsigned long long seen = clock.load();
+    while (seen < stamp.counter && !clock.compare_exchange_weak(seen, stamp.counter)) {
     }
-    return "";
+}
+
+// Each applies one change here and forwards it; the caller holds groups_mutex.
+void Tracker::set_member(Group& group, const string& user_id, bool present, const Stamp& stamp) {
+    group.members.apply(user_id, present, "", stamp);
+    send_sync_message(make_message({"synced_MEMBER", group.group_id, user_id, present ? "1" : "0", stamp.str()}));
+}
+
+void Tracker::set_pending(Group& group, const string& user_id, bool present, const Stamp& stamp) {
+    group.pending_requests.apply(user_id, present, "", stamp);
+    send_sync_message(make_message({"synced_PENDING", group.group_id, user_id, present ? "1" : "0", stamp.str()}));
+}
+
+void Tracker::set_seeder(Group& group, FileInfo& file, const string& addr, bool present, const Stamp& stamp) {
+    file.seeders.apply(addr, present, "", stamp);
+    send_sync_message(make_message({"synced_SEEDER", group.group_id, file.filename, addr, present ? "1" : "0",
+                                    stamp.str()}));
 }
 
 // --- Tracker Synchronization Logic ---
@@ -783,6 +829,10 @@ void Tracker::listen_for_tracker() {
     while (true) {
         int sync_sock = accept(listener_socket, nullptr, nullptr);
         if (sync_sock < 0) continue;
+        if (!sync_enabled) {
+            close(sync_sock);
+            continue;
+        }
         log_msg("Other tracker connected for synchronization.");
         run_sync_session(sync_sock);
     }
@@ -791,6 +841,10 @@ void Tracker::listen_for_tracker() {
 void Tracker::connect_to_other_tracker() {
     bool reported = false;
     while (true) {
+        if (!sync_enabled) {
+            this_thread::sleep_for(chrono::milliseconds(200));
+            continue;
+        }
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in server_addr{};
         server_addr.sin_family = AF_INET;
@@ -847,7 +901,7 @@ void Tracker::wait_to_serve_alone() {
 // target of live sync messages. The snapshot is taken with every state lock held,
 // and other_tracker_socket_mutex is taken before they are released, so each change
 // is either already in the snapshot or sent after it, never lost in between.
-// Applying the same message twice is harmless.
+// Tombstones are sent too, and applying the same message twice is harmless.
 void Tracker::send_snapshot_and_attach(int sync_socket) {
     vector<string> snapshot;
     unique_lock<mutex> users_lock(users_mutex);
@@ -855,30 +909,31 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
     unique_lock<mutex> socket_lock(socket_to_user_mutex);
     unique_lock<mutex> groups_lock(groups_mutex);
 
-    for (const auto& [user_id, record] : users) {
-        snapshot.push_back(make_message({"synced_CREATE_USER", user_id, record}));
+    auto flag = [](const LwwEntry& e) { return e.present ? "1" : "0"; };
+    for (const auto& [user_id, e] : users.entries()) {
+        snapshot.push_back(make_message({"synced_USER", user_id, e.value, e.stamp.str()}));
     }
-    for (const auto& [user_id, addr] : logged_in_users) {
-        snapshot.push_back(make_message({"synced_LOGIN", user_id, addr}));
+    for (const auto& [user_id, e] : logged_in_users.entries()) {
+        snapshot.push_back(make_message({"synced_SESSION", user_id, flag(e), e.present ? e.value : "-", e.stamp.str()}));
     }
     for (const auto& [group_id, group] : groups) {
-        snapshot.push_back(make_message({"synced_CREATE_GROUP", group_id, group.owner_id}));
-        for (const auto& member : group.members) {
-            snapshot.push_back(make_message({"synced_ACCEPT_REQUEST", group_id, member}));
+        snapshot.push_back(make_message({"synced_GROUP", group_id, group.owner_id, group.owner_stamp.str()}));
+        for (const auto& [user_id, e] : group.members.entries()) {
+            snapshot.push_back(make_message({"synced_MEMBER", group_id, user_id, flag(e), e.stamp.str()}));
         }
-        for (const auto& pending : group.pending_requests) {
-            snapshot.push_back(make_message({"synced_JOIN_GROUP", group_id, pending}));
+        for (const auto& [user_id, e] : group.pending_requests.entries()) {
+            snapshot.push_back(make_message({"synced_PENDING", group_id, user_id, flag(e), e.stamp.str()}));
         }
         for (const auto& [filename, file] : group.files) {
-            vector<string> msg = {"synced_UPLOAD", group_id, filename, to_string(file.file_size), file.file_hash,
+            vector<string> msg = {"synced_FILE", group_id, filename, to_string(file.file_size), file.file_hash,
                                   file.share_key};
             for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
                 msg.push_back(file.piece_hashes.at(i));
             }
-            msg.push_back(file.seeders.empty() ? "-" : *file.seeders.begin());
+            msg.push_back(file.stamp.str());
             snapshot.push_back(make_message(msg));
-            for (const auto& seeder : file.seeders) {
-                snapshot.push_back(make_message({"synced_ADD_SEEDER", group_id, filename, seeder}));
+            for (const auto& [addr, e] : file.seeders.entries()) {
+                snapshot.push_back(make_message({"synced_SEEDER", group_id, filename, addr, flag(e), e.stamp.str()}));
             }
         }
     }
@@ -943,10 +998,9 @@ void Tracker::process_sync_command(const vector<string>& args) {
 
     // Minimum argument count (including the command) for each sync message.
     static const map<string, size_t> min_args = {
-        {"synced_CREATE_USER", 3}, {"synced_LOGIN", 3}, {"synced_LOGOUT", 3},
-        {"synced_CREATE_GROUP", 3}, {"synced_JOIN_GROUP", 3}, {"synced_LEAVE_GROUP", 3},
-        {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 7}, {"synced_STOP_SHARE", 4},
-        {"synced_ADD_SEEDER", 4}, {"synced_RESULT", 3}, {"synced_SNAPSHOT_END", 2},
+        {"synced_USER", 4}, {"synced_SESSION", 5}, {"synced_GROUP", 4}, {"synced_MEMBER", 5},
+        {"synced_PENDING", 5}, {"synced_FILE", 7}, {"synced_SEEDER", 6},
+        {"synced_RESULT", 3}, {"synced_SNAPSHOT_END", 2},
     };
     auto rule = min_args.find(command);
     if (rule == min_args.end() || args.size() < rule->second) {
@@ -960,64 +1014,68 @@ void Tracker::process_sync_command(const vector<string>& args) {
     }
 }
 
+// Every state change ends with its stamp and is applied last-writer-wins, so
+// changes may arrive twice or in any order. A change to a group or file that we
+// don't have is dropped: messages on the link (and snapshots) put the group and
+// file first.
 void Tracker::apply_sync_command(const vector<string>& args) {
     const string& command = args[0];
 
-    if (command == "synced_CREATE_USER") {
-        lock_guard<mutex> lock(users_mutex);
-        users[args[1]] = args[2];
-    } else if (command == "synced_LOGIN") {
-        lock_guard<mutex> lock(logged_in_users_mutex);
-        logged_in_users[args[1]] = args[2];
-    } else if (command == "synced_LOGOUT") {
-        lock_guard<mutex> lock(logged_in_users_mutex);
-        logged_in_users.erase(args[1]);
-        lock_guard<mutex> g_lock(groups_mutex);
-        for(auto& g_pair : groups) for(auto& f_pair : g_pair.second.files) f_pair.second.seeders.erase(args[2]);
-    } else if (command == "synced_CREATE_GROUP") {
-        lock_guard<mutex> lock(groups_mutex);
-        // Create only if absent: a snapshot must not wipe members or files we already have.
-        if (!groups.count(args[1])) {
-            Group g; g.group_id = args[1]; g.owner_id = args[2]; g.members.insert(args[2]); groups[args[1]] = g;
-        }
-    } else if (command == "synced_JOIN_GROUP") {
-        lock_guard<mutex> lock(groups_mutex);
-        if(groups.count(args[1])) groups.at(args[1]).pending_requests.insert(args[2]);
-    } else if (command == "synced_LEAVE_GROUP") {
-        lock_guard<mutex> lock(groups_mutex);
-        if(groups.count(args[1])) groups.at(args[1]).members.erase(args[2]);
-    } else if (command == "synced_ACCEPT_REQUEST") {
-        lock_guard<mutex> lock(groups_mutex);
-        if(groups.count(args[1])) {
-            groups.at(args[1]).pending_requests.erase(args[2]);
-            groups.at(args[1]).members.insert(args[2]);
-        }
-    } else if (command == "synced_UPLOAD") {
-        lock_guard<mutex> lock(groups_mutex);
-        const string& group_id = args[1];
-        const string& filename = args[2];
-        FileInfo& file = groups[group_id].files[filename];
-        file.filename = filename;
-        file.file_size = stoll(args[3]);
-        file.file_hash = args[4];
-        file.share_key = args[5];
-        for(size_t i = 6; i < args.size() - 1; ++i) file.piece_hashes[i-6] = args[i];
-        if (args.back() != "-") file.seeders.insert(args.back());
-    } else if (command == "synced_STOP_SHARE") {
-        lock_guard<mutex> lock(groups_mutex);
-        if(groups.count(args[1]) && groups.at(args[1]).files.count(args[2])) {
-            groups.at(args[1]).files.at(args[2]).seeders.erase(args[3]);
-        }
-    } else if (command == "synced_ADD_SEEDER") {
-        lock_guard<mutex> lock(groups_mutex);
-        if(groups.count(args[1]) && groups.at(args[1]).files.count(args[2])) {
-            groups.at(args[1]).files.at(args[2]).seeders.insert(args[3]);
-        }
-    } else if (command == "synced_RESULT") {
+    if (command == "synced_RESULT") {
         remember_result(args[1], args[2]);
-    } else if (command == "synced_SNAPSHOT_END") {
+        return;
+    }
+    if (command == "synced_SNAPSHOT_END") {
         caught_up = true;
         log_msg("Caught up with other tracker's state (" + args[1] + " messages).");
+        return;
+    }
+
+    Stamp stamp;
+    if (!Stamp::parse(args.back(), stamp)) {
+        throw invalid_argument("bad stamp " + args.back());
+    }
+    observe(stamp);
+
+    if (command == "synced_USER") {
+        lock_guard<mutex> lock(users_mutex);
+        users.apply(args[1], true, args[2], stamp);
+    } else if (command == "synced_SESSION") {
+        lock_guard<mutex> lock(logged_in_users_mutex);
+        logged_in_users.apply(args[1], args[2] == "1", args[3], stamp);
+    } else if (command == "synced_GROUP") {
+        lock_guard<mutex> lock(groups_mutex);
+        Group& group = groups[args[1]];
+        group.group_id = args[1];
+        if (group.owner_id.empty() || group.owner_stamp < stamp) {
+            group.owner_id = args[2];
+            group.owner_stamp = stamp;
+        }
+    } else if (command == "synced_MEMBER" || command == "synced_PENDING") {
+        lock_guard<mutex> lock(groups_mutex);
+        auto it = groups.find(args[1]);
+        if (it == groups.end()) return;
+        LwwMap& users_in = command == "synced_MEMBER" ? it->second.members : it->second.pending_requests;
+        users_in.apply(args[2], args[3] == "1", "", stamp);
+    } else if (command == "synced_FILE") {
+        lock_guard<mutex> lock(groups_mutex);
+        auto it = groups.find(args[1]);
+        if (it == groups.end()) return;
+        FileInfo& file = it->second.files[args[2]];
+        file.filename = args[2];
+        if (file.stamp < stamp) {
+            file.file_size = stoll(args[3]);
+            file.file_hash = args[4];
+            file.share_key = args[5];
+            file.piece_hashes.clear();
+            for (size_t i = 6; i + 1 < args.size(); ++i) file.piece_hashes[i - 6] = args[i];
+            file.stamp = stamp;
+        }
+    } else if (command == "synced_SEEDER") {
+        lock_guard<mutex> lock(groups_mutex);
+        auto it = groups.find(args[1]);
+        if (it == groups.end() || !it->second.files.count(args[2])) return;
+        it->second.files.at(args[2]).seeders.apply(args[3], args[4] == "1", "", stamp);
     }
 }
 

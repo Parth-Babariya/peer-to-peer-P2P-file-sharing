@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <deque>
+#include "lww.h"
 
 using namespace std;
 
@@ -20,14 +21,16 @@ struct FileInfo {
     // presents it, and the tracker hands it out only to group members.
     string share_key;
     map<int, string> piece_hashes;
-    set<string> seeders; // client_ip:port
+    Stamp stamp;    // of the fields above; a re-upload replaces them
+    LwwMap seeders; // client_ip:port
 };
 
 struct Group {
     string group_id;
     string owner_id;
-    set<string> members;
-    set<string> pending_requests;
+    Stamp owner_stamp;
+    LwwMap members;
+    LwwMap pending_requests;
     map<string, FileInfo> files;
 };
 
@@ -50,6 +53,11 @@ private:
     void apply_sync_command(const vector<string>& args);
     void send_sync_message(const string& message);
     void wait_to_serve_alone();
+    Stamp next_stamp();
+    void observe(const Stamp& stamp);
+    void set_member(Group& group, const string& user_id, bool present, const Stamp& stamp);
+    void set_pending(Group& group, const string& user_id, bool present, const Stamp& stamp);
+    void set_seeder(Group& group, FileInfo& file, const string& addr, bool present, const Stamp& stamp);
 
     // Command handlers
     void create_user(int sock, const vector<string>& args);
@@ -82,11 +90,15 @@ private:
     int tracker_id;
     int server_socket;
 
-    // Synchronized data
-    map<string, string> users; // user_id -> hash_password() record, never the password
-    map<string, string> logged_in_users; // user_id -> client_ip:port
-    map<int, string> socket_to_user; // client_socket -> user_id
+    // Synchronized data. Everything the other tracker also holds is last-writer-wins
+    // (lww.h), and every change to it is synced as one stamped state change.
+    LwwMap users; // user_id -> hash_password() record, never the password
+    LwwMap logged_in_users; // user_id -> client_ip:port
+    map<int, string> socket_to_user; // client_socket -> user_id (this tracker's connections only)
     map<string, Group> groups;
+    // Lamport clock: above every stamp this tracker has made or seen, so each new
+    // change outranks everything it could have known about.
+    atomic<unsigned long long> clock{0};
 
     // Mutexes. When holding more than one, always take them in this order:
     //   users -> logged_in_users -> socket_to_user -> groups -> other_tracker_socket
@@ -102,6 +114,10 @@ private:
     // applied), or the other one stayed unreachable for a grace period. Until then
     // clients are turned away: an empty, restarted tracker must not answer for both.
     atomic<bool> caught_up{false};
+    atomic<bool> sync_session_active{false};
+    // Cleared by the console's "disconnect" (to simulate a network split) and set
+    // again by "reconnect".
+    atomic<bool> sync_enabled{true};
 
     // Replies to recent state-changing commands, by request id, on both trackers:
     // a command retried after failover gets its first reply instead of running
@@ -109,7 +125,6 @@ private:
     map<string, string> results;
     deque<string> results_order;
     mutex results_mutex;
-    atomic<bool> sync_session_active{false};
 };
 
 #endif // TRACKER_H
