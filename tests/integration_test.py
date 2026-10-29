@@ -183,14 +183,26 @@ def frame(args, payload):
     return data if args.wire == "raw" else struct.pack("!I", len(data)) + data
 
 
+def recv_exact(sock, n):
+    """Reads exactly n bytes, or fewer if the peer closes. (MSG_WAITALL isn't
+    enough: Python makes a socket with a timeout non-blocking underneath.)"""
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def ask(args, sock, line, binary=False):
     """Sends one message on a raw socket and returns the reply."""
     sock.sendall(frame(args, line))
     if args.wire == "raw":
         reply = sock.recv(65536)
     else:
-        (n,) = struct.unpack("!I", sock.recv(4, socket.MSG_WAITALL))
-        reply = sock.recv(n, socket.MSG_WAITALL) if n else b""
+        (n,) = struct.unpack("!I", recv_exact(sock, 4))
+        reply = recv_exact(sock, n)
     return reply if binary else reply.decode(errors="replace")
 
 
