@@ -36,7 +36,8 @@ struct Group {
 
 class Tracker {
 public:
-    Tracker(const string& info_file, int tracker_num);
+    // state_file: where this tracker keeps its state across restarts.
+    Tracker(const string& info_file, int tracker_num, const string& state_file);
     void start();
 
 private:
@@ -53,7 +54,10 @@ private:
     void apply_sync_command(const vector<string>& args);
     void send_sync_message(const string& message);
     void wait_to_serve_alone();
-    Stamp next_stamp();
+    vector<string> state_messages();
+    void load_state();
+    void persist(const string& message);
+Stamp next_stamp();
     void observe(const Stamp& stamp);
     void set_member(Group& group, const string& user_id, bool present, const Stamp& stamp);
     void set_pending(Group& group, const string& user_id, bool present, const Stamp& stamp);
@@ -102,6 +106,7 @@ private:
 
     // Mutexes. When holding more than one, always take them in this order:
     //   users -> logged_in_users -> socket_to_user -> groups -> other_tracker_socket
+    // state_file_mutex comes after groups and is never held with other_tracker_socket.
     // Taking them in different orders on two threads can deadlock.
     mutex users_mutex;
     mutex logged_in_users_mutex;
@@ -125,6 +130,13 @@ private:
     map<string, string> results;
     deque<string> results_order;
     mutex results_mutex;
+
+    // Every state change, this tracker's and the other's, appended as its sync
+    // message and flushed to disk. Replayed and compacted at startup, so the
+    // state survives both trackers going down.
+    string state_file;
+    int state_fd = -1;
+    mutex state_file_mutex;
 };
 
 #endif // TRACKER_H

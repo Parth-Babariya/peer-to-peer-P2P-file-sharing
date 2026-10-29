@@ -152,6 +152,8 @@ Open **two terminals**:
 
 They can be started in either order, and either one can be restarted at any time: tracker 1 retries the connection every second, and on reconnect each sends the other its full state.
 
+Each tracker also keeps its state on disk, in `tracker1.state` / `tracker2.state` in the current directory (or the path given with `--state-file <path>`). Every change is appended and flushed (`fdatasync`) before the client gets its reply, so even if both trackers crash together nothing acknowledged is lost. On startup a tracker replays the file and rewrites it as one compact snapshot. Delete the files to start from scratch.
+
 ---
 
 ### 3. Start a Client
@@ -246,7 +248,7 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 
 ##  Known Limitations
 
-* **Tracker state lives in memory.** A restarted tracker gets everything back from the other one, but if both go down together, the state is lost.
+* **The state file is compacted only at startup**, so it grows while a tracker runs. Replies to raw commands sent without a request id can go out a moment before the change reaches the disk.
 * **Conflicts during a split are settled by Lamport order, not by the clock on the wall.** If both sides change the same item while cut off, the change with the higher stamp wins, which need not be the later one in real time. Tombstones are never cleaned up.
 * **Nothing is encrypted in transit.** Passwords travel from client to tracker in plain text (there is no TLS); only what the trackers store and sync is hashed.
 * **A share key can't be revoked.** Someone who leaves a group keeps the keys of files they already fetched metadata for.

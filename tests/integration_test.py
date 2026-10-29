@@ -619,6 +619,28 @@ def test_split_does_not_undo_removals(cl):
     e.cmd("download_file g f.bin " + cl.path("e.bin"), r"No seeders")
 
 
+def test_state_survives_both_trackers_dying(cl):
+    # Every change is on disk before the client hears back, so killing both
+    # trackers at once (SIGKILL: no chance to save anything) loses nothing.
+    a = cl.client("a", "a", group="g")
+    b = cl.client("b", "b")
+    join(a, b, "g")
+    data = write_random(cl.path("f.bin"), 2 * PIECE + 1, 19)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    cl.t1.kill()
+    cl.t2.kill()
+    cl.t1 = cl._spawn("tracker1", [cl.args.tracker, "trackers.txt", "1"])
+    cl.t2 = cl._spawn("tracker2", [cl.args.tracker, "trackers.txt", "2"])
+    for t in (cl.t1, cl.t2):
+        t.wait_for(r"Loaded [1-9]\d* changes")
+        t.wait_for("Caught up with other tracker")
+    b.cmd("list_files g", OK + " f.bin")  # b reconnects and logs back in
+    b.cmd(f"download_file g f.bin {cl.path('b.bin')}", r"Starting download")
+    b.wait_for(r"Download completed", timeout=20)
+    with open(cl.path("b.bin"), "rb") as f:
+        assert f.read() == data
+
+
 def test_failover_keeps_session(cl):
     a = cl.client("a", "a", group="g")
     cl.t1.kill()

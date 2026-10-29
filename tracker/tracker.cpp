@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <csignal>
 #include <algorithm>
+#include <fstream>
+#include <cerrno>
 
 using namespace std;
 
@@ -26,7 +28,8 @@ void send_response(int sock, const string& msg) {
     send_msg(sock, msg);
 }
 
-Tracker::Tracker(const string& info_file, int tracker_num) : tracker_id(tracker_num) {
+Tracker::Tracker(const string& info_file, int tracker_num, const string& state_file)
+    : tracker_id(tracker_num), state_file(state_file) {
     int fd = open(info_file.c_str(), O_RDONLY);
     if (fd < 0) {
         perror("Failed to open tracker_info.txt");
@@ -64,6 +67,8 @@ Tracker::Tracker(const string& info_file, int tracker_num) : tracker_id(tracker_
 }
 
 void Tracker::start() {
+    load_state();
+
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
         perror("Socket creation failed");
@@ -903,12 +908,35 @@ void Tracker::wait_to_serve_alone() {
 // is either already in the snapshot or sent after it, never lost in between.
 // Tombstones are sent too, and applying the same message twice is harmless.
 void Tracker::send_snapshot_and_attach(int sync_socket) {
-    vector<string> snapshot;
     unique_lock<mutex> users_lock(users_mutex);
     unique_lock<mutex> session_lock(logged_in_users_mutex);
     unique_lock<mutex> socket_lock(socket_to_user_mutex);
     unique_lock<mutex> groups_lock(groups_mutex);
 
+    vector<string> snapshot = state_messages();
+
+    lock_guard<mutex> lock(other_tracker_socket_mutex);
+    groups_lock.unlock();
+    socket_lock.unlock();
+    session_lock.unlock();
+    users_lock.unlock();
+
+    // The end marker lets the other side know (and log) when it has caught up.
+    snapshot.push_back("synced_SNAPSHOT_END " + to_string(snapshot.size()));
+    for (const auto& msg : snapshot) {
+        if (!send_msg(sync_socket, msg)) {
+            shutdown(sync_socket, SHUT_RDWR); // the reader thread notices and closes it
+            return;
+        }
+    }
+    log_msg("Sent state snapshot (" + to_string(snapshot.size() - 1) + " messages) to other tracker.");
+    other_tracker_socket = sync_socket;
+}
+
+// The whole state, tombstones included, as sync messages. Caller holds every
+// state lock.
+vector<string> Tracker::state_messages() {
+    vector<string> snapshot;
     auto flag = [](const LwwEntry& e) { return e.present ? "1" : "0"; };
     for (const auto& [user_id, e] : users.entries()) {
         snapshot.push_back(make_message({"synced_USER", user_id, e.value, e.stamp.str()}));
@@ -937,23 +965,7 @@ void Tracker::send_snapshot_and_attach(int sync_socket) {
             }
         }
     }
-
-    lock_guard<mutex> lock(other_tracker_socket_mutex);
-    groups_lock.unlock();
-    socket_lock.unlock();
-    session_lock.unlock();
-    users_lock.unlock();
-
-    // The end marker lets the other side know (and log) when it has caught up.
-    snapshot.push_back("synced_SNAPSHOT_END " + to_string(snapshot.size()));
-    for (const auto& msg : snapshot) {
-        if (!send_msg(sync_socket, msg)) {
-            shutdown(sync_socket, SHUT_RDWR); // the reader thread notices and closes it
-            return;
-        }
-    }
-    log_msg("Sent state snapshot (" + to_string(snapshot.size() - 1) + " messages) to other tracker.");
-    other_tracker_socket = sync_socket;
+    return snapshot;
 }
 
 void Tracker::handle_sync_connection(int sync_socket) {
@@ -978,7 +990,87 @@ void Tracker::handle_sync_connection(int sync_socket) {
     close(sync_socket);
 }
 
+static bool well_formed(const vector<string>& args);
+
+// Writes all of `data`, looping over partial writes.
+static bool write_all(int fd, const string& data) {
+    size_t done = 0;
+    while (done < data.size()) {
+        ssize_t n = write(fd, data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += n;
+    }
+    return true;
+}
+
+// Replays the state file, then rewrites it as one snapshot (so it doesn't keep
+// growing across restarts) and keeps it open for appending.
+void Tracker::load_state() {
+    size_t applied = 0;
+    {
+        ifstream in(state_file, ios::binary);
+        string line;
+        while (getline(in, line)) {
+            if (in.eof()) break; // no newline: a write cut short by a crash
+            vector<string> args;
+            if (!decode_fields(line, args) || !well_formed(args)) continue;
+            try {
+                apply_sync_command(args);
+                applied++;
+            } catch (const exception&) {
+            }
+        }
+    }
+
+    vector<string> messages;
+    {
+        lock_guard<mutex> users_lock(users_mutex);
+        lock_guard<mutex> session_lock(logged_in_users_mutex);
+        lock_guard<mutex> socket_lock(socket_to_user_mutex);
+        lock_guard<mutex> groups_lock(groups_mutex);
+        messages = state_messages();
+    }
+    string data;
+    for (const auto& msg : messages) data += msg + "\n";
+
+    // Write the compacted copy beside the file, then swap it in with rename(),
+    // which is atomic: a crash leaves either the old file or the new one.
+    string tmp = state_file + ".tmp";
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    bool ok = fd >= 0 && write_all(fd, data) && fsync(fd) == 0;
+    if (fd >= 0) close(fd);
+    ok = ok && rename(tmp.c_str(), state_file.c_str()) == 0;
+    if (ok) {
+        size_t slash = state_file.find_last_of('/');
+        string dir = slash == string::npos ? "." : state_file.substr(0, slash + 1);
+        int dir_fd = open(dir.c_str(), O_RDONLY);
+        if (dir_fd >= 0) {
+            fsync(dir_fd); // makes the rename itself durable
+            close(dir_fd);
+        }
+        state_fd = open(state_file.c_str(), O_WRONLY | O_APPEND);
+    }
+    if (state_fd < 0) {
+        log_msg("Warning: cannot write " + state_file + "; state will not survive a restart.");
+        return;
+    }
+    log_msg("Loaded " + to_string(applied) + " changes from " + state_file + " (" +
+            to_string(messages.size()) + " after compaction).");
+}
+
+// Appends one state change and waits until it is on disk.
+void Tracker::persist(const string& message) {
+    lock_guard<mutex> lock(state_file_mutex);
+    if (state_fd < 0) return;
+    if (!write_all(state_fd, message + "\n") || fdatasync(state_fd) != 0) {
+        log_msg("Warning: failed to write " + state_file + ".");
+    }
+}
+
 void Tracker::send_sync_message(const string& message) {
+    // Replies to retried requests are only a cache; everything else is state.
+    if (message.rfind("synced_RESULT ", 0) != 0) persist(message);
     lock_guard<mutex> lock(other_tracker_socket_mutex);
     if (other_tracker_socket != -1) {
         if (!send_msg(other_tracker_socket, message)) {
@@ -992,18 +1084,22 @@ void Tracker::send_sync_message(const string& message) {
     }
 }
 
-void Tracker::process_sync_command(const vector<string>& args) {
-    const string& command = args[0];
-    log_msg("Received sync command: " + args[0]);
-
-    // Minimum argument count (including the command) for each sync message.
-    static const map<string, size_t> min_args = {
+// A known sync message with at least the fields it needs.
+static bool well_formed(const vector<string>& args) {
+static const map<string, size_t> min_args = {
         {"synced_USER", 4}, {"synced_SESSION", 5}, {"synced_GROUP", 4}, {"synced_MEMBER", 5},
         {"synced_PENDING", 5}, {"synced_FILE", 7}, {"synced_SEEDER", 6},
         {"synced_RESULT", 3}, {"synced_SNAPSHOT_END", 2},
     };
-    auto rule = min_args.find(command);
-    if (rule == min_args.end() || args.size() < rule->second) {
+    auto rule = min_args.find(args[0]);
+    return rule != min_args.end() && args.size() >= rule->second;
+}
+
+void Tracker::process_sync_command(const vector<string>& args) {
+    const string& command = args[0];
+    log_msg("Received sync command: " + args[0]);
+
+    if (!well_formed(args)) {
         log_msg("Ignoring malformed sync message: " + command);
         return;
     }
@@ -1011,6 +1107,10 @@ void Tracker::process_sync_command(const vector<string>& args) {
         apply_sync_command(args);
     } catch (const exception& e) {
         log_msg(string("Ignoring malformed sync message: ") + e.what());
+        return;
+    }
+    if (command != "synced_RESULT" && command != "synced_SNAPSHOT_END") {
+        persist(make_message(args));
     }
 }
 
@@ -1081,8 +1181,9 @@ void Tracker::apply_sync_command(const vector<string>& args) {
 
 // --- Main Function ---
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: ./tracker <tracker_info_file> <tracker_no>" << endl;
+    const string usage = "Usage: ./tracker <tracker_info_file> <tracker_no> [--state-file <path>]";
+    if (argc != 3 && !(argc == 5 && string(argv[3]) == "--state-file")) {
+        cerr << usage << endl;
         return 1;
     }
     string info_file = argv[1];
@@ -1096,7 +1197,8 @@ int main(int argc, char* argv[]) {
     // A client hanging up mid-reply must give an error, not kill the tracker.
     signal(SIGPIPE, SIG_IGN);
 
-    Tracker tracker(info_file, tracker_num);
+    string state_file = argc == 5 ? argv[4] : "tracker" + tracker_arg + ".state";
+    Tracker tracker(info_file, tracker_num, state_file);
     tracker.start();
 
     return 0;
