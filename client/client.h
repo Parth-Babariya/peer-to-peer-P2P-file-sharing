@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <chrono>
 
 using namespace std;
 
@@ -22,13 +23,17 @@ struct DownloadState {
 
 class Client {
 public:
-    Client(const string& tracker_info_file);
+    // upload_limit_kbps: cap on bytes served to peers (0 = no cap), to emulate a home uplink.
+    // partial_sharing: serve pieces of a file while still downloading it.
+    Client(const string& tracker_info_file, long long upload_limit_kbps, bool partial_sharing);
     void run();
 
 private:
     int open_seeder_socket();
     void start_seeder_service(int seeder_socket);
     void handle_peer_connection(int peer_socket);
+    void send_paced(int sock, const string& data);
+    void pace(size_t bytes);
     void process_user_input();
     
     // connection failover management
@@ -64,6 +69,11 @@ private:
 
     map<string, string> shared_files; // filename -> local_path
     mutex shared_files_mutex;
+
+    bool partial_sharing;
+    long long upload_limit_bytes; // per second, 0 = unlimited
+    mutex pace_mutex;
+    chrono::steady_clock::time_point pace_next;
 };
 
 #endif // CLIENT_H

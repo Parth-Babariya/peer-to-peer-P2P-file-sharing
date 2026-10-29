@@ -123,8 +123,8 @@ class Cluster:
         self.procs.append(p)
         return p
 
-    def client(self, name, user=None, info="trackers.txt", group=None):
-        c = self._spawn(name, [self.args.client, info])
+    def client(self, name, user=None, info="trackers.txt", group=None, flags=()):
+        c = self._spawn(name, [self.args.client, info, *flags])
         c.seeder_port = int(re.search(r"(\d+)$", c.wait_for(r"Seeder listening on port \d+")).group(1))
         if user:
             c.cmd(f"create_user {user} pw", OK + "|already exists")
@@ -234,6 +234,50 @@ def test_sync_burst(cl):
     line = c.cmd("list_groups")
     missing = [f"burst{i:02d}" for i in range(30) if f"burst{i:02d}" not in line]
     assert not missing, f"tracker 2 is missing {len(missing)} of 30 groups: {missing[:5]}..."
+
+
+def seeders_used(client):
+    return set(re.findall(r"Downloading piece \d+ from seeder (\S+)", "\n".join(client.lines)))
+
+
+def test_download_uses_several_seeders(cl):
+    a = cl.client("a", "a", group="g")
+    data = write_random(cl.path("f.bin"), 12 * PIECE + 99, 12)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    for name in ["b", "c"]:
+        peer = cl.client(name, name)
+        join(a, peer, "g")
+        peer.cmd(f"download_file g f.bin {cl.path(name + '.bin')}", r"Starting download")
+        peer.wait_for(r"Download completed", timeout=20)
+    d = cl.client("d", "d")
+    join(a, d, "g")
+    d.cmd(f"download_file g f.bin {cl.path('d.bin')}", r"Starting download")
+    d.wait_for(r"Download completed", timeout=20)
+    with open(cl.path("d.bin"), "rb") as f:
+        assert f.read() == data
+    assert len(seeders_used(d)) == 3, f"pieces came from only {seeders_used(d)}"
+
+
+def test_downloaders_share_pieces_before_finishing(cl):
+    # The only full copy is on a slow uplink, so b and c are still downloading
+    # while they trade the pieces each already has.
+    a = cl.client("a", "a", group="g", flags=["--upload-limit", "2048"])
+    data = write_random(cl.path("f.bin"), 16 * PIECE, 13)
+    a.cmd(f"upload_file g {cl.path('f.bin')}")
+    b = cl.client("b", "b")
+    c = cl.client("c", "c")
+    join(a, b, "g")
+    join(a, c, "g")
+    b.send(f"download_file g f.bin {cl.path('b.bin')}")
+    c.send(f"download_file g f.bin {cl.path('c.bin')}")
+    b.wait_for(r"Download completed", timeout=30)
+    c.wait_for(r"Download completed", timeout=30)
+    for name in ["b", "c"]:
+        with open(cl.path(name + ".bin"), "rb") as f:
+            assert f.read() == data, f"{name} got a corrupt copy"
+    b_addr, c_addr = f"127.0.0.1:{b.seeder_port}", f"127.0.0.1:{c.seeder_port}"
+    assert c_addr in seeders_used(b) or b_addr in seeders_used(c), \
+        "neither downloader fetched anything from the other"
 
 
 def test_cannot_log_out_someone_else(cl):

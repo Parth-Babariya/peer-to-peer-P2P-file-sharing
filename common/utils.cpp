@@ -77,7 +77,7 @@ void log_msg(const string& msg) {
 }
 
 // send() and read() may move fewer bytes than asked; these loop until all of them are done.
-static bool send_all(int sock, const char* data, size_t len) {
+bool send_all(int sock, const char* data, size_t len) {
     while (len > 0) {
         ssize_t n = send(sock, data, len, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;

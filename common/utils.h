@@ -42,4 +42,7 @@ void log_msg(const string& msg);
 bool send_msg(int sock, const string& msg);
 bool recv_msg(int sock, string& msg);
 
+// Sends exactly len bytes, looping over partial sends.
+bool send_all(int sock, const char* data, size_t len);
+
 #endif // UTILS_H

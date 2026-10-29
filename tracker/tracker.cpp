@@ -550,6 +550,8 @@ void Tracker::download_file(int sock, const vector<string>& args) {
 
     const string& group_id = args[1];
     const string& filename = args[2];
+    // A client that is already seeding part of this file doesn't need itself listed.
+    string requester_addr = get_address_from_user_id(user_id);
 
     lock_guard<mutex> lock(groups_mutex);
     if (!groups.count(group_id)) {
@@ -567,7 +569,11 @@ void Tracker::download_file(int sock, const vector<string>& args) {
     }
 
     FileInfo& file = group.files.at(filename);
-    if (file.seeders.empty()) {
+    vector<string> seeders;
+    for (const auto& seeder : file.seeders) {
+        if (seeder != requester_addr) seeders.push_back(seeder);
+    }
+    if (seeders.empty()) {
         send_response(sock, "error :  No seeders available for this file.");
         return;
     }
@@ -583,7 +589,7 @@ void Tracker::download_file(int sock, const vector<string>& args) {
     for (size_t i = 0; i < file.piece_hashes.size(); ++i) {
         response << " " << file.piece_hashes.at(i);
     }
-    for (const auto& seeder : file.seeders) {
+    for (const auto& seeder : seeders) {
         response << " " << seeder;
     }
     send_response(sock, response.str());
