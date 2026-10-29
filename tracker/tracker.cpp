@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <csignal>
 
 using namespace std;
 
@@ -90,12 +91,12 @@ void Tracker::start() {
     
     string command;
     cout << "Tracker console running. Type 'quit' to shut down." << endl;
-    while (true) {
-        cin >> command;
+    while (cin >> command) {
         if (command == "quit") {
             exit(0);
         }
     }
+    // stdin closed (e.g. running in the background): keep serving.
 
     close(server_socket);
     client_thread.join();
@@ -141,6 +142,16 @@ void Tracker::handle_client(int client_socket, const string& client_addr) {
 }
 
 void Tracker::process_command(int sock, const string& client_addr, const vector<string>& args) {
+    // A malformed number (stoll) or similar must cost the client an error, not crash the tracker.
+    try {
+        dispatch_command(sock, client_addr, args);
+    } catch (const exception& e) {
+        send_response(sock, "error :  Bad arguments");
+        log_msg(string("Rejected malformed command: ") + e.what());
+    }
+}
+
+void Tracker::dispatch_command(int sock, const string& client_addr, const vector<string>& args) {
     const string& command = args[0];
     if (command == "create_user") create_user(sock, args);
     else if (command == "login") login(sock, client_addr, args);
@@ -479,6 +490,11 @@ void Tracker::upload_file(int sock, const vector<string>& args) {
     new_file.filename = filename;
     new_file.file_size = stoll(args[3]);
     new_file.file_hash = args[4];
+    long long expected_pieces = (new_file.file_size + PIECE_SIZE - 1) / PIECE_SIZE;
+    if (new_file.file_size < 0 || (long long)args.size() - 5 != expected_pieces) {
+        send_response(sock, "error :  Piece hash count does not match the file size.");
+        return;
+    }
     
     for (size_t i = 5; i < args.size(); ++i) {
         new_file.piece_hashes[i-5] = args[i];
@@ -719,6 +735,28 @@ void Tracker::process_sync_command(const vector<string>& args) {
     const string& command = args[0];
     log_msg("Received sync command: " + args[0]);
 
+    // Minimum argument count (including the command) for each sync message.
+    static const map<string, size_t> min_args = {
+        {"synced_CREATE_USER", 3}, {"synced_LOGIN", 3}, {"synced_LOGOUT", 3},
+        {"synced_CREATE_GROUP", 3}, {"synced_JOIN_GROUP", 3}, {"synced_LEAVE_GROUP", 3},
+        {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 6}, {"synced_STOP_SHARE", 4},
+        {"synced_ADD_SEEDER", 4},
+    };
+    auto rule = min_args.find(command);
+    if (rule == min_args.end() || args.size() < rule->second) {
+        log_msg("Ignoring malformed sync message: " + command);
+        return;
+    }
+    try {
+        apply_sync_command(args);
+    } catch (const exception& e) {
+        log_msg(string("Ignoring malformed sync message: ") + e.what());
+    }
+}
+
+void Tracker::apply_sync_command(const vector<string>& args) {
+    const string& command = args[0];
+
     if (command == "synced_CREATE_USER") {
         lock_guard<mutex> lock(users_mutex);
         users[args[1]] = args[2];
@@ -775,7 +813,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     string info_file = argv[1];
-    int tracker_num = stoi(argv[2]);
+    string tracker_arg = argv[2];
+    if (tracker_arg != "1" && tracker_arg != "2") {
+        cerr << "tracker_no must be 1 or 2" << endl;
+        return 1;
+    }
+    int tracker_num = stoi(tracker_arg);
+
+    // A client hanging up mid-reply must give an error, not kill the tracker.
+    signal(SIGPIPE, SIG_IGN);
 
     Tracker tracker(info_file, tracker_num);
     tracker.start();

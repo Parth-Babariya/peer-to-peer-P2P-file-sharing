@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <csignal>
 
 using namespace std;
 
@@ -54,10 +55,8 @@ Client::Client(const string& tracker_info_file)
 
 void Client::run() 
 {
-    thread seeder_thread(&Client::start_seeder_service, this);
+    thread seeder_thread(&Client::start_seeder_service, this, open_seeder_socket());
     seeder_thread.detach();
-    
-    this_thread::sleep_for(chrono::milliseconds(100));
 
     if (!connect_to_available_tracker()) 
     {
@@ -204,16 +203,22 @@ void Client::handle_login(const vector<string>& args) {
     }
 }
 
-void Client::start_seeder_service() {
+// Binds the seeder socket on a random free port. Runs before the tracker
+// connection so seeder_port is set before login sends it.
+int Client::open_seeder_socket() {
     int seeder_socket = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in seeder_addr;
+    if (seeder_socket < 0) {
+        perror("Seeder socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+    sockaddr_in seeder_addr{};
     seeder_addr.sin_family = AF_INET;
     seeder_addr.sin_addr.s_addr = INADDR_ANY;
-    
+
     random_device rd;
     mt19937 gen(rd());
     uniform_int_distribution<> distrib(10000, 65000);
-    
+
     while(true) {
         seeder_port = distrib(gen);
         seeder_addr.sin_port = htons(seeder_port);
@@ -221,13 +226,19 @@ void Client::start_seeder_service() {
             break;
         }
     }
-    
+
     listen(seeder_socket, 10);
     log_msg("Seeder listening on port " + to_string(seeder_port));
-    
+    return seeder_socket;
+}
+
+void Client::start_seeder_service(int seeder_socket) {
     while (true) {
         int peer_sock = accept(seeder_socket, nullptr, nullptr);
         if (peer_sock < 0) continue;
+        // Don't let a peer that connects and goes quiet hold a thread forever.
+        timeval timeout{10, 0};
+        setsockopt(peer_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         thread peer_handler(&Client::handle_peer_connection, this, peer_sock);
         peer_handler.detach();
     }
@@ -244,9 +255,12 @@ void Client::handle_peer_connection(int peer_socket) {
     // The reply is always one message: the piece's bytes, or empty if we can't serve it.
     string piece;
     auto args = parse(request, " ");
-    if (args.size() == 3 && args[0] == "get_piece") {
+    // Peers are untrusted: the index must be a plain non-negative number.
+    bool valid = args.size() == 3 && args[0] == "get_piece" && !args[2].empty() && args[2].size() <= 9 &&
+                 all_of(args[2].begin(), args[2].end(), ::isdigit);
+    if (valid) {
         const string& filename = args[1];
-        int piece_index = stoi(args[2]);
+        long piece_index = stol(args[2]);
 
         string file_path;
         {
@@ -516,6 +530,9 @@ int main(int argc, char* argv[]) {
         cerr << "Usage: ./client <tracker_info.txt>" << endl;
         return 1;
     }
+
+    // A peer hanging up mid-send must give an error, not kill the process.
+    signal(SIGPIPE, SIG_IGN);
 
     string tracker_info_file = argv[1];
 

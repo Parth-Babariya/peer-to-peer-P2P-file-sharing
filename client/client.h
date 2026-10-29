@@ -26,7 +26,8 @@ public:
     void run();
 
 private:
-    void start_seeder_service();
+    int open_seeder_socket();
+    void start_seeder_service(int seeder_socket);
     void handle_peer_connection(int peer_socket);
     void process_user_input();
     

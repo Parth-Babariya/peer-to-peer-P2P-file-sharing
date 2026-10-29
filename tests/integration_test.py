@@ -291,6 +291,30 @@ def test_tracker_survives_garbage(cl):
     a.cmd("list_groups")
 
 
+def test_tracker_rejects_malformed_upload(cl):
+    # Talk to the tracker directly, as a buggy or hostile client could.
+    s = socket.create_connection(("127.0.0.1", cl.ports[0]))
+    s.settimeout(5)
+
+    def ask(line):
+        s.sendall(frame(cl.args, line))
+        if cl.args.wire == "raw":
+            return s.recv(65536).decode(errors="replace")
+        (n,) = struct.unpack("!I", s.recv(4, socket.MSG_WAITALL))
+        return s.recv(n, socket.MSG_WAITALL).decode(errors="replace")
+
+    ask("create_user z pw")
+    ask("login z pw 5000")
+    ask("create_group q")
+    reply = ask("upload_file q f.bin notanumber deadbeef")
+    assert reply.startswith("error"), f"unexpected reply {reply!r}"
+    reply = ask("upload_file q f.bin 2000000 deadbeef onlyonehash")
+    assert reply.startswith("error"), f"accepted 1 piece hash for a 4-piece file: {reply!r}"
+    s.close()
+    time.sleep(0.3)
+    assert cl.t1.alive(), "tracker 1 died on a malformed upload"
+
+
 def test_failover_keeps_session(cl):
     a = cl.client("a", "a", group="g")
     cl.t1.kill()

@@ -38,7 +38,9 @@ private:
     void handle_sync_connection(int sync_socket);
     void connect_to_other_tracker();
     void process_command(int client_socket, const string& client_addr, const vector<string>& args);
+    void dispatch_command(int client_socket, const string& client_addr, const vector<string>& args);
     void process_sync_command(const vector<string>& args);
+    void apply_sync_command(const vector<string>& args);
     void send_sync_message(const string& message);
 
     // Command handlers
