@@ -167,7 +167,10 @@ string Client::reconnect() {
 // fails over to the other tracker, logs back in, and retries the command once.
 // A tracker that is still catching up sends us to the other one, back and forth,
 // for up to CATCH_UP_WAIT.
-string Client::send_to_tracker(const string& command) {
+string Client::send_to_tracker(const string& message) {
+    // The same id goes with every retry, so a tracker that already ran this
+    // command (or heard from the other tracker that it ran) replays its reply.
+    const string command = "#" + random_hex(8) + " " + message;
     lock_guard<mutex> lock(tracker_mutex);
     auto deadline = chrono::steady_clock::now() + CATCH_UP_WAIT;
     bool lost_once = false;

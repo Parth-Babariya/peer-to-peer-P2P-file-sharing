@@ -29,7 +29,7 @@ This implementation is designed with the constraint of using only **standard sys
   * **Bad seeders:** a seeder that can't be reached, hangs up, times out (10 s) or sends a bad piece is dropped.
   * **Refreshing:** once a second, and whenever the workers run out of work, the downloader re-asks the tracker for seeders and the seeders for their pieces. If three refreshes in a row find nothing to fetch, the download is marked failed.
 * **Partial sharing:** a client registers as a seeder as soon as its download starts and serves the pieces it has already verified. A crowd of downloaders therefore feeds itself instead of everyone waiting on the original uploader (see the benchmark below).
-* **Failover**: if a command to the tracker fails, the client connects to the other tracker, logs back in with the saved credentials and retries the command once.
+* **Failover**: if a command to the tracker fails, the client connects to the other tracker, logs back in with the saved credentials and retries the command once. Every command carries a random request id, and the retry reuses it; both trackers remember the replies to recent state-changing commands, so a command that the dead tracker had already run is answered, not run again.
 
 ### Wire protocol
 
@@ -249,4 +249,3 @@ Without partial sharing the single seed must upload 8 x 8 MB, so 32 s is the flo
 * **Nothing is encrypted in transit.** Passwords travel from client to tracker in plain text (there is no TLS); only what the trackers store and sync is hashed.
 * **A share key can't be revoked.** Someone who leaves a group keeps the keys of files they already fetched metadata for.
 * **Each piece request opens a new TCP connection**, and there is no choking or tit-for-tat incentive as in BitTorrent.
-* A command retried after failover may already have been applied by the tracker that died (for example, `create_group` then reports that the group exists).

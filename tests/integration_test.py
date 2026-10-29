@@ -560,6 +560,26 @@ def test_lone_restarted_tracker_waits_before_serving(cl):
     t1.wait_for("serving clients from our own state")
 
 
+def test_retried_command_runs_once(cl):
+    # After a failover the client resends a command under the same request id.
+    # If the tracker that died had already run it, the retry must get the first
+    # reply, not "group already exists".
+    s1 = socket.create_connection(("127.0.0.1", cl.ports[0]), timeout=5)
+    ask(cl.args, s1, "create_user z pw")
+    ask(cl.args, s1, "login z pw 5000")
+    first = ask(cl.args, s1, "#0011223344556677 create_group g")
+    assert first.startswith("success"), first
+    s1.close()
+    cl.t1.kill()
+    s2 = socket.create_connection(("127.0.0.1", cl.ports[1]), timeout=5)
+    ask(cl.args, s2, "login z pw 5000")
+    retry = ask(cl.args, s2, "#0011223344556677 create_group g")
+    assert retry == first, f"the retry ran again: {retry!r}"
+    again = ask(cl.args, s2, "#8899aabbccddeeff create_group g")
+    assert again.startswith("error"), f"a new request was answered from the cache: {again!r}"
+    s2.close()
+
+
 def test_failover_keeps_session(cl):
     a = cl.client("a", "a", group="g")
     cl.t1.kill()

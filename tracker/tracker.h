@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <deque>
 
 using namespace std;
 
@@ -43,7 +44,7 @@ private:
     void connect_to_other_tracker();
     void run_sync_session(int sync_socket);
     void send_snapshot_and_attach(int sync_socket);
-    void process_command(int client_socket, const string& client_addr, const vector<string>& args);
+    void process_command(int client_socket, const string& client_addr, vector<string> args);
     void dispatch_command(int client_socket, const string& client_addr, const vector<string>& args);
     void process_sync_command(const vector<string>& args);
     void apply_sync_command(const vector<string>& args);
@@ -70,6 +71,8 @@ private:
     // Helper methods
     string get_user_id_from_socket(int sock);
     string get_address_from_user_id(const string& user_id);
+    bool find_result(const string& request_id, string& reply);
+    void remember_result(const string& request_id, const string& reply);
     
     // Server state
     string ip_addr;
@@ -99,6 +102,13 @@ private:
     // applied), or the other one stayed unreachable for a grace period. Until then
     // clients are turned away: an empty, restarted tracker must not answer for both.
     atomic<bool> caught_up{false};
+
+    // Replies to recent state-changing commands, by request id, on both trackers:
+    // a command retried after failover gets its first reply instead of running
+    // twice. Oldest dropped first. results_mutex is never held with another lock.
+    map<string, string> results;
+    deque<string> results_order;
+    mutex results_mutex;
     atomic<bool> sync_session_active{false};
 };
 

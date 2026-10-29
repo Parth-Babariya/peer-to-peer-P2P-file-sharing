@@ -14,7 +14,15 @@
 
 using namespace std;
 
+// While a state-changing command runs, its reply is captured here instead of
+// sent, so it can be recorded and synced first (see process_command).
+static thread_local string* captured_reply = nullptr;
+
 void send_response(int sock, const string& msg) {
+    if (captured_reply) {
+        *captured_reply = msg;
+        return;
+    }
     send_msg(sock, msg);
 }
 
@@ -151,13 +159,68 @@ void Tracker::handle_client(int client_socket, const string& client_addr) {
     close(client_socket);
 }
 
-void Tracker::process_command(int sock, const string& client_addr, const vector<string>& args) {
+// Commands whose repeat would not be harmless (a second create_group fails).
+static const set<string> STATE_CHANGING = {
+    "create_user", "create_group", "join_group", "leave_group", "accept_request",
+    "upload_file", "stop_share", "i_am_seeder",
+};
+static const size_t MAX_REMEMBERED_RESULTS = 10000;
+
+// args may start with "#<request_id>". The client sends a fresh id per command
+// and the same id when it retries that command after a failover.
+void Tracker::process_command(int sock, const string& client_addr, vector<string> args) {
+    string request_id;
+    if (args[0].size() > 1 && args[0][0] == '#') {
+        request_id = args[0].substr(1);
+        args.erase(args.begin());
+        if (args.empty()) {
+            send_response(sock, "error :  Bad arguments");
+            return;
+        }
+    }
+    bool once_only = !request_id.empty() && STATE_CHANGING.count(args[0]);
+    string reply;
+    if (once_only && find_result(request_id, reply)) {
+        log_msg("Replaying the reply to retried request " + request_id + ".");
+        send_response(sock, reply);
+        return;
+    }
+
+    if (once_only) captured_reply = &reply;
     // A malformed number (stoll) or similar must cost the client an error, not crash the tracker.
     try {
         dispatch_command(sock, client_addr, args);
     } catch (const exception& e) {
         send_response(sock, "error :  Bad arguments");
         log_msg(string("Rejected malformed command: ") + e.what());
+    }
+    if (!once_only) return;
+    captured_reply = nullptr;
+
+    // The change itself was synced by the handler; the result follows, and only
+    // then does the client hear back. A tracker that dies before replying has
+    // passed on both, unless it dies in the moment between the two messages.
+    remember_result(request_id, reply);
+    send_sync_message(make_message({"synced_RESULT", request_id, reply}));
+    send_response(sock, reply);
+}
+
+bool Tracker::find_result(const string& request_id, string& reply) {
+    lock_guard<mutex> lock(results_mutex);
+    auto it = results.find(request_id);
+    if (it == results.end()) return false;
+    reply = it->second;
+    return true;
+}
+
+void Tracker::remember_result(const string& request_id, const string& reply) {
+    lock_guard<mutex> lock(results_mutex);
+    if (results.count(request_id)) return;
+    results[request_id] = reply;
+    results_order.push_back(request_id);
+    if (results_order.size() > MAX_REMEMBERED_RESULTS) {
+        results.erase(results_order.front());
+        results_order.pop_front();
     }
 }
 
@@ -883,7 +946,7 @@ void Tracker::process_sync_command(const vector<string>& args) {
         {"synced_CREATE_USER", 3}, {"synced_LOGIN", 3}, {"synced_LOGOUT", 3},
         {"synced_CREATE_GROUP", 3}, {"synced_JOIN_GROUP", 3}, {"synced_LEAVE_GROUP", 3},
         {"synced_ACCEPT_REQUEST", 3}, {"synced_UPLOAD", 7}, {"synced_STOP_SHARE", 4},
-        {"synced_ADD_SEEDER", 4}, {"synced_SNAPSHOT_END", 2},
+        {"synced_ADD_SEEDER", 4}, {"synced_RESULT", 3}, {"synced_SNAPSHOT_END", 2},
     };
     auto rule = min_args.find(command);
     if (rule == min_args.end() || args.size() < rule->second) {
@@ -950,6 +1013,8 @@ void Tracker::apply_sync_command(const vector<string>& args) {
         if(groups.count(args[1]) && groups.at(args[1]).files.count(args[2])) {
             groups.at(args[1]).files.at(args[2]).seeders.insert(args[3]);
         }
+    } else if (command == "synced_RESULT") {
+        remember_result(args[1], args[2]);
     } else if (command == "synced_SNAPSHOT_END") {
         caught_up = true;
         log_msg("Caught up with other tracker's state (" + args[1] + " messages).");
