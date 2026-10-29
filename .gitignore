@@ -1,0 +1,4 @@
+*.o
+tracker/tracker
+client/client
+__pycache__/
